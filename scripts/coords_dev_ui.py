@@ -4,7 +4,7 @@
 坐标检视开发界面（Web版）
 - 复用现有棋盘数据，渲染17x17格子
 - 每格显示：本地坐标(南/西/北/东 r,c) 与 全局(row,col)
-- 依托 game/coords.py 的算法生成八条桥接规则涉及的源/目标全局格子并高亮
+- 依托本地轻量坐标工具生成源/目标全局格子并高亮（不再依赖 game.coords）
 
 启动：python scripts/coords_dev_ui.py
 将生成 dev_coords.html 并启动本地HTTP服务 http://localhost:8000/dev_coords.html
@@ -19,19 +19,101 @@ from typing import Dict, Tuple, List
 from game.game_logic import GameLogic
 from game.board import CellType, Position
 from game.piece import Player
-from game.coords import (
-    north_edge,
-    south_edge,
-    west_near_center_edge,
-    west_far_edge,
-    east_near_center_edge,
-    east_far_edge,
-    row10_west_line,
-    row10_east_line,
-    to_global,
-    from_global,
-    corner_positions,
-)
+
+# === 轻量坐标工具（与棋盘硬编码一致） ===
+# 约定：局部坐标均为 1..5，对应靠九宫格一侧为 1，远离九宫格为 5。
+
+def north_edge(local_col: int) -> List[Tuple[int, int]]:
+    """北侧边线五点：局部列=1或5，行=1..5。
+    映射：局部(r,c) -> 全局(row=6-r, col=11-c)
+    返回顺序：从靠角的一端开始（r=1..5）。
+    """
+    assert 1 <= local_col <= 5
+    col = 11 - local_col
+    return [(6 - r, col) for r in range(1, 6)]
+
+
+def south_edge(local_col: int) -> List[Tuple[int, int]]:
+    """南侧边线五点：局部列=1或5，行=1..5。
+    映射：局部(r,c) -> 全局(row=10+r, col=5+c)
+    返回顺序：从靠角的一端开始（r=1..5）。
+    """
+    assert 1 <= local_col <= 5
+    col = 5 + local_col
+    return [(10 + r, col) for r in range(1, 6)]
+
+
+def west_near_center_edge() -> List[Tuple[int, int]]:
+    """西侧靠九宫格的边（局部列=5 的五点）。全局行10，列5→1。"""
+    return [(10, c) for c in range(5, 0, -1)]
+
+
+def west_far_edge() -> List[Tuple[int, int]]:
+    """西侧远离九宫格的边（局部列=1 的五点）。全局行6，列5→1。"""
+    return [(6, c) for c in range(5, 0, -1)]
+
+
+def east_near_center_edge() -> List[Tuple[int, int]]:
+    """东侧靠九宫格的边（局部列=1 的五点）。全局行10，列11→15。"""
+    return [(10, c) for c in range(11, 16)]
+
+
+def east_far_edge() -> List[Tuple[int, int]]:
+    """东侧远离九宫格的边（局部列=5 的五点）。全局行6，列11→15。"""
+    return [(6, c) for c in range(11, 16)]
+
+
+def row10_west_line() -> List[Tuple[int, int]]:
+    """南角桥接到西侧的横线（全局行10，列5..1）。"""
+    return [(10, c) for c in range(5, 0, -1)]
+
+
+def row10_east_line() -> List[Tuple[int, int]]:
+    """南角桥接到东侧的横线（全局行10，列11..15）。"""
+    return [(10, c) for c in range(11, 16)]
+
+
+# === 通用坐标转换API（与棋盘公式一致） ===
+
+def to_global(player: "Player|str", local_row: int, local_col: int) -> Tuple[int, int]:
+    """将各阵营本地坐标转换为全局(row,col)。"""
+    side = player.name if hasattr(player, "name") else str(player)
+    if side in ("PLAYER1", "南"):
+        return 10 + local_row, 5 + local_col
+    if side in ("PLAYER3", "北"):
+        return 6 - local_row, 11 - local_col
+    if side in ("PLAYER2", "西"):
+        return 5 + local_col, 6 - local_row
+    # 默认东方
+    return 11 - local_col, 10 + local_row
+
+
+def from_global(player: "Player|str", row: int, col: int) -> Tuple[int, int]:
+    """将全局(row,col)转换为各阵营本地坐标(r,c)。与 to_global 互逆。"""
+    side = player.name if hasattr(player, "name") else str(player)
+    if side in ("PLAYER1", "南"):
+        return row - 10, col - 5
+    if side in ("PLAYER3", "北"):
+        return 6 - row, 11 - col
+    if side in ("PLAYER2", "西"):
+        return 6 - col, row - 5
+    # 东方
+    return col - 10, 11 - row
+
+
+def corner_positions() -> dict:
+    """返回四侧两角的全局坐标字典，键为 ('南1,1','南1,5',...)/中文标签。"""
+    corners = {
+        "南1,1": to_global("南", 1, 1),
+        "南1,5": to_global("南", 1, 5),
+        "北1,1": to_global("北", 1, 1),
+        "北1,5": to_global("北", 1, 5),
+        "西1,1": to_global("西", 1, 1),
+        "西1,5": to_global("西", 1, 5),
+        "东1,1": to_global("东", 1, 1),
+        "东1,5": to_global("东", 1, 5),
+    }
+    return corners
 
 
 def _player_label(player: Player | None) -> str:
@@ -202,3 +284,99 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# === 轻量坐标工具（与棋盘硬编码一致） ===
+# 约定：局部坐标均为 1..5，对应靠九宫格一侧为 1，远离九宫格为 5。
+
+def north_edge(local_col: int) -> List[Tuple[int, int]]:
+    """北侧边线五点：局部列=1或5，行=1..5。
+    映射：局部(r,c) -> 全局(row=6-r, col=11-c)
+    返回顺序：从靠角的一端开始（r=1..5）。
+    """
+    assert 1 <= local_col <= 5
+    col = 11 - local_col
+    return [(6 - r, col) for r in range(1, 6)]
+
+
+def south_edge(local_col: int) -> List[Tuple[int, int]]:
+    """南侧边线五点：局部列=1或5，行=1..5。
+    映射：局部(r,c) -> 全局(row=10+r, col=5+c)
+    返回顺序：从靠角的一端开始（r=1..5）。
+    """
+    assert 1 <= local_col <= 5
+    col = 5 + local_col
+    return [(10 + r, col) for r in range(1, 6)]
+
+
+def west_near_center_edge() -> List[Tuple[int, int]]:
+    """西侧靠九宫格的边（局部列=5 的五点）。全局行10，列5→1。"""
+    return [(10, c) for c in range(5, 0, -1)]
+
+
+def west_far_edge() -> List[Tuple[int, int]]:
+    """西侧远离九宫格的边（局部列=1 的五点）。全局行6，列5→1。"""
+    return [(6, c) for c in range(5, 0, -1)]
+
+
+def east_near_center_edge() -> List[Tuple[int, int]]:
+    """东侧靠九宫格的边（局部列=1 的五点）。全局行10，列11→15。"""
+    return [(10, c) for c in range(11, 16)]
+
+
+def east_far_edge() -> List[Tuple[int, int]]:
+    """东侧远离九宫格的边（局部列=5 的五点）。全局行6，列11→15。"""
+    return [(6, c) for c in range(11, 16)]
+
+
+def row10_west_line() -> List[Tuple[int, int]]:
+    """南角桥接到西侧的横线（全局行10，列5..1）。"""
+    return [(10, c) for c in range(5, 0, -1)]
+
+
+def row10_east_line() -> List[Tuple[int, int]]:
+    """南角桥接到东侧的横线（全局行10，列11..15）。"""
+    return [(10, c) for c in range(11, 16)]
+
+
+# === 通用坐标转换API（与棋盘公式一致） ===
+
+def to_global(player: "Player|str", local_row: int, local_col: int) -> Tuple[int, int]:
+    """将各阵营本地坐标转换为全局(row,col)。"""
+    side = player.name if hasattr(player, "name") else str(player)
+    if side in ("PLAYER1", "南"):
+        return 10 + local_row, 5 + local_col
+    if side in ("PLAYER3", "北"):
+        return 6 - local_row, 11 - local_col
+    if side in ("PLAYER2", "西"):
+        return 5 + local_col, 6 - local_row
+    # 默认东方
+    return 11 - local_col, 10 + local_row
+
+
+def from_global(player: "Player|str", row: int, col: int) -> Tuple[int, int]:
+    """将全局(row,col)转换为各阵营本地坐标(r,c)。与 to_global 互逆。"""
+    side = player.name if hasattr(player, "name") else str(player)
+    if side in ("PLAYER1", "南"):
+        return row - 10, col - 5
+    if side in ("PLAYER3", "北"):
+        return 6 - row, 11 - col
+    if side in ("PLAYER2", "西"):
+        return 6 - col, row - 5
+    # 东方
+    return col - 10, 11 - row
+
+
+def corner_positions() -> dict:
+    """返回四侧两角的全局坐标字典，键为 ('南1,1','南1,5',...)/中文标签。"""
+    corners = {
+        "南1,1": to_global("南", 1, 1),
+        "南1,5": to_global("南", 1, 5),
+        "北1,1": to_global("北", 1, 1),
+        "北1,5": to_global("北", 1, 5),
+        "西1,1": to_global("西", 1, 1),
+        "西1,5": to_global("西", 1, 5),
+        "东1,1": to_global("东", 1, 1),
+        "东1,5": to_global("东", 1, 5),
+    }
+    return corners

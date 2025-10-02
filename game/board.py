@@ -8,16 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 from enum import Enum
 from .piece import Piece, Player
-from .coords import (
-    north_edge,
-    south_edge,
-    west_near_center_edge,
-    west_far_edge,
-    east_near_center_edge,
-    east_far_edge,
-    row10_west_line,
-    row10_east_line,
-)
+# 已移除未使用的 .coords 边线/行线函数导入（本文件现全部使用硬编码坐标）
 
 @dataclass
 class Position:
@@ -349,6 +340,9 @@ class Board:
         if cell and cell.piece:
             piece = cell.piece
             cell.piece = None
+            # 清除该位置的标记（标记面向棋子）
+            if position in self.player_marks:
+                del self.player_marks[position]
             return piece
         return None
     
@@ -841,25 +835,68 @@ class Board:
         moving_piece = from_cell.piece
         target_piece = to_cell.piece
         
+        # 标记处理：记录起止位置是否有标记（标记面向棋子，随棋子移动/死亡而清除）
+        had_from_mark = from_pos in self.player_marks
+        had_to_mark = to_pos in self.player_marks
+
+        # 记录在此次移动/战斗中死亡的司令所属玩家集合
+        dead_commander_players: Set[Player] = set()
+
         # 处理战斗
         if target_piece:
             winner = self._battle(moving_piece, target_piece)
             if winner == moving_piece:
                 # 攻击方获胜
+                # 若防守方是司令，记录该司令所属玩家
+                if target_piece.piece_type.name == 'COMMANDER':
+                    dead_commander_players.add(target_piece.player)
+                # 战绩：攻击方继承防守方战绩并+1
+                moving_piece.kill_count += (target_piece.kill_count + 1)
                 to_cell.piece = moving_piece
                 from_cell.piece = None
+                # 移动方的标记随棋子移动到新位置；防守方棋子死亡，其标记清除
+                if had_from_mark:
+                    self.player_marks[to_pos] = self.player_marks.pop(from_pos)
+                if had_to_mark:
+                    # 防守方死亡，清除其标记
+                    del self.player_marks[to_pos]
             elif winner == target_piece:
-                # 防守方获胜
+                # 防守方获胜（攻击方死亡）
+                # 若攻击方是司令，记录该司令所属玩家
+                if moving_piece.piece_type.name == 'COMMANDER':
+                    dead_commander_players.add(moving_piece.player)
+                # 战绩：防守方继承攻击方战绩并+1
+                target_piece.kill_count += (moving_piece.kill_count + 1)
                 from_cell.piece = None
+                # 攻击方死亡，清除其标记；防守方存活，其标记保留
+                if had_from_mark:
+                    del self.player_marks[from_pos]
             else:
-                # 同归于尽
+                # 同归于尽（双方同时死亡）
+                # 若任一方为司令，记录对应玩家
+                if moving_piece.piece_type.name == 'COMMANDER':
+                    dead_commander_players.add(moving_piece.player)
+                if target_piece.piece_type.name == 'COMMANDER':
+                    dead_commander_players.add(target_piece.player)
                 from_cell.piece = None
                 to_cell.piece = None
+                # 双方标记均清除
+                if had_from_mark:
+                    del self.player_marks[from_pos]
+                if had_to_mark:
+                    del self.player_marks[to_pos]
         else:
             # 移动到空位置
             to_cell.piece = moving_piece
             from_cell.piece = None
+            # 标记随棋子移动到新位置
+            if had_from_mark:
+                self.player_marks[to_pos] = self.player_marks.pop(from_pos)
         
+        # 若司令死亡，仅亮明该司令所属玩家的军旗位置；若双方司令同归于尽，则各自所属玩家的军旗均亮明
+        if dead_commander_players:
+            self._reveal_flags_for_players(dead_commander_players)
+
         return True
     
     def _battle(self, attacker: Piece, defender: Piece) -> Optional[Piece]:
@@ -907,3 +944,20 @@ class Board:
     def get_mark(self, position: Position) -> Optional[str]:
         """获取位置标记"""
         return self.player_marks.get(position)
+    
+    def reveal_all_pieces(self) -> None:
+        """将棋盘上所有棋子设置为可见"""
+        for cell in self.cells.values():
+            if cell.piece:
+                cell.piece.visible = True
+    def _get_axis_players(self, player: Player) -> Set[Player]:
+        """根据玩家方向返回同轴玩家集合：南北轴(PLAYER1/PLAYER3)或东西轴(PLAYER2/PLAYER4)"""
+        if player in {Player.PLAYER1, Player.PLAYER3}:
+            return {Player.PLAYER1, Player.PLAYER3}
+        else:
+            return {Player.PLAYER2, Player.PLAYER4}
+    def _reveal_flags_for_players(self, players: Set[Player]) -> None:
+        """将指定玩家集合的军旗设置为可见"""
+        for cell in self.cells.values():
+            if cell.piece and cell.piece.is_flag() and cell.piece.player in players:
+                cell.piece.visible = True

@@ -29,8 +29,8 @@ class GameLogic:
         self.setup_complete: Dict[Player, bool] = {}
         # 已被淘汰的玩家集合（投降或被消灭）
         self.eliminated_players: Set[Player] = set()
-        # 测试模式：显示所有棋子并允许操作所有玩家
-        self.testing_mode: bool = True
+        # 测试模式：显示所有棋子并允许操作所有玩家（默认关闭）
+        self.testing_mode: bool = False
         
         # 初始化玩家棋子
         for player in Player:

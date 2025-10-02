@@ -36,6 +36,7 @@ class Piece:
     piece_type: PieceType
     player: Player
     visible: bool = False  # 是否对其他玩家可见
+    kill_count: int = 0    # 战绩：累计击杀数
     
     def __str__(self):
         return f"{self.player.name}的{self.piece_type.value}"

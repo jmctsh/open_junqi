@@ -7,7 +7,7 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QStatusBar, QMessageBox, QMenu, QScrollArea)
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QSize, QTimer
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QMouseEvent
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QMouseEvent, QCursor
 from .game_logic import GameLogic, GameState
 from .board import Position, CellType
 from .piece import Player
@@ -94,7 +94,10 @@ class BoardWidget(QWidget):
             painter.drawRect(rect)
             
             # 临时显示坐标信息（开发调试用）
-            self._draw_coordinate_info(painter, x, y, pos, cell)
+            # 注意：开发模式由 GameLogic.testing_mode 控制
+            # 原行为为始终显示；现改为仅当 testing_mode=True 时显示
+            if self.game_logic.testing_mode:
+                self._draw_coordinate_info(painter, x, y, pos, cell)
             
             # 绘制连接线
             center_x = x + self.cell_size // 2
@@ -123,6 +126,10 @@ class BoardWidget(QWidget):
     
     def _draw_coordinate_info(self, painter, x, y, pos, cell):
         """临时显示坐标信息（开发调试用）"""
+        # 若未开启开发模式，则不绘制坐标
+        if not self.game_logic.testing_mode:
+            return
+        
         # 设置字体
         font = QFont("Arial", 6)
         painter.setFont(font)
@@ -318,7 +325,46 @@ class BoardWidget(QWidget):
         from PyQt6.QtCore import QPoint
         polygon = QPolygon([QPoint(x, y) for x, y in points])
         painter.drawPolygon(polygon)
-    
+
+    # 新增：在棋子右下角绘制战绩标记（1杀“^”、2杀上下“^ ^”、3及以上为小星）
+    def _draw_kill_marks(self, painter, cell_top_left_x: int, cell_top_left_y: int, piece):
+        kill_count = getattr(piece, 'kill_count', 0)
+        if kill_count <= 0:
+            return
+        padding = 3
+        overlay_w = max(12, self.cell_size // 4)
+        overlay_h = max(12, self.cell_size // 4)
+        rect = QRect(
+            cell_top_left_x + self.cell_size - overlay_w - padding,
+            cell_top_left_y + self.cell_size - overlay_h - padding,
+            overlay_w,
+            overlay_h
+        )
+        if kill_count == 1:
+            # 单杀：右下角一个“^”
+            mark_font = QFont("SimHei", max(8, self.cell_size // 7), QFont.Weight.Bold)
+            painter.setFont(mark_font)
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "^")
+        elif kill_count == 2:
+            # 双杀：上下紧凑排列两个“^”
+            mark_font = QFont("SimHei", max(7, self.cell_size // 8), QFont.Weight.Bold)
+            painter.setFont(mark_font)
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            half_h = rect.height() // 2
+            rect_top = QRect(rect.left(), rect.top(), rect.width(), half_h)
+            rect_bottom = QRect(rect.left(), rect.top() + half_h - 1, rect.width(), half_h)
+            painter.drawText(rect_top, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "^")
+            painter.drawText(rect_bottom, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "^")
+        else:
+            # 三杀及以上：右下角小金色五角星
+            star_size = max(4, self.cell_size // 10)
+            center_x = cell_top_left_x + self.cell_size - star_size - padding
+            center_y = cell_top_left_y + self.cell_size - star_size - padding
+            painter.setPen(QPen(QColor(255, 215, 0), 2))
+            painter.setBrush(QBrush(QColor(255, 215, 0, 220)))
+            self._draw_star(painter, center_x, center_y, star_size)
+
     def _draw_pieces(self, painter):
         """绘制棋子"""
         font = QFont("SimHei", 10, QFont.Weight.Bold)
@@ -344,8 +390,16 @@ class BoardWidget(QWidget):
                 # 绘制棋子文字
                 painter.setPen(QPen(QColor(255, 255, 255)))
                 text = self._get_piece_display_text(cell.piece)
+                # 有标记时，不显示“?”
+                if text == "?" and pos in self.board.player_marks and self.board.player_marks[pos]:
+                    text = ""
                 text_rect = QRect(x, y, self.cell_size, self.cell_size)
                 painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+                
+                # 新增：叠加绘制战绩标记（随棋子移动、棋子死亡不显示）
+                self._draw_kill_marks(painter, x, y, cell.piece)
+                # 恢复主字体，避免影响后续绘制
+                painter.setFont(font)
     
     def _get_player_color(self, player: Player) -> QColor:
         """获取玩家颜色"""
@@ -359,13 +413,11 @@ class BoardWidget(QWidget):
     
     def _get_piece_display_text(self, piece) -> str:
         """获取棋子显示文字"""
-        current_player = self.game_logic.current_player
-        
-        # 如果是当前玩家的棋子，显示具体类型
-        if piece.player == current_player or piece.visible:
+        # 第一视角：始终显示南方玩家的棋子；开发模式或显式可见也显示
+        # 修复 Bug：开始后只有首手玩家可见；改为南位（玩家1）始终自见
+        if piece.player == Player.PLAYER1 or piece.visible or self.game_logic.testing_mode:
             return piece.piece_type.value
         else:
-            # 其他玩家的棋子显示为"?"
             return "?"
     
     def _draw_selection(self, painter):
@@ -390,16 +442,16 @@ class BoardWidget(QWidget):
     
     def _draw_marks(self, painter):
         """绘制玩家标记"""
-        font = QFont("Arial", 8, QFont.Weight.Bold)
+        font = QFont("SimHei", 10, QFont.Weight.Bold)
         painter.setFont(font)
-        painter.setPen(QPen(QColor(255, 0, 255)))
+        painter.setPen(QPen(QColor(0, 0, 0)))
         
         for pos, mark in self.board.player_marks.items():
             x = self.margin + pos.col * (self.cell_size + self.cell_spacing)
             y = self.margin + pos.row * (self.cell_size + self.cell_spacing)
-            # 在格子右上角显示标记
-            text_rect = QRect(x + self.cell_size - 15, y, 15, 15)
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, mark)
+            # 在格子左上角显示标记
+            text_rect = QRect(x, y, 16, 16)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, mark)
 
     def _draw_turn_indicator(self, painter):
         """在当前玩家棋盘本地坐标(6,3)的正下方绘制回合标记（避免遮挡）"""
@@ -494,6 +546,8 @@ class GameWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.game_logic = GameLogic()
+        # 开发模式开关（默认关闭）
+        self.dev_mode: bool = False
         self.setup_ui()
         self.connect_signals()
         # 启动时自动布局四方后刷新显示
@@ -529,6 +583,18 @@ class GameWindow(QMainWindow):
         
         # 创建控制按钮
         button_layout = QHBoxLayout()
+        
+        # 开发模式按钮（可开关）：允许显示全局上帝视角、操作所有棋子、显示坐标
+        self.dev_mode_button = QPushButton("开发模式")
+        self.dev_mode_button.setCheckable(True)
+        self.dev_mode_button.setChecked(self.dev_mode)
+        # 通过底部全局控制模块决定是否显示按钮
+        try:
+            self.dev_mode_button.setVisible(DEV_MODE_BUTTON_VISIBLE)
+        except NameError:
+            # 若全局控制未定义，默认显示
+            self.dev_mode_button.setVisible(True)
+        button_layout.addWidget(self.dev_mode_button)
         
         self.start_button = QPushButton("开始游戏")
         self.reset_button = QPushButton("重置游戏")
@@ -584,7 +650,9 @@ class GameWindow(QMainWindow):
         self.auto_layout_button.clicked.connect(self.auto_layout)
         self.skip_button.clicked.connect(self.skip_turn)
         self.surrender_button.clicked.connect(self.surrender)
-    
+        # 开发模式按钮开关：动态切换坐标显示与棋子权限/可见性
+        self.dev_mode_button.toggled.connect(self.toggle_dev_mode)
+
     def on_cell_clicked(self, row: int, col: int, button: int):
         """处理格子点击事件"""
         position = Position(row, col)
@@ -600,6 +668,11 @@ class GameWindow(QMainWindow):
             # 布局阶段：支持点击选中后进行交换
             cell = self.game_logic.board.get_cell(position)
             if cell and cell.piece:
+                # 非开发模式：只能选择当前玩家的棋子
+                if (not self.game_logic.testing_mode) and (cell.piece.player != self.game_logic.current_player):
+                    self.status_bar.showMessage("非开发模式下，仅可调整当前玩家的棋子")
+                    self.board_widget.clear_selection()
+                    return
                 if self.board_widget.selected_position is None:
                     self.board_widget.set_selection(position, [])
                 else:
@@ -619,18 +692,30 @@ class GameWindow(QMainWindow):
             return
         from_pos = Position(fr, fc)
         to_pos = Position(tr, tc)
+        # 非开发模式：起点必须为当前玩家棋子
+        from_cell = self.game_logic.board.get_cell(from_pos)
+        if (not self.game_logic.testing_mode) and (not from_cell or not from_cell.piece or from_cell.piece.player != self.game_logic.current_player):
+            self.status_bar.showMessage("非开发模式下，仅可调整当前玩家的棋子")
+            self.board_widget.clear_selection()
+            return
         if self.game_logic.swap_setup_positions(from_pos, to_pos):
             self.board_widget.clear_selection()
             self.update_display()
         else:
             self.board_widget.clear_selection()
             QMessageBox.warning(self, "非法调整", "该位置不符合布局规则，已恢复。")
-    
+
     def handle_piece_move(self, position: Position):
         """处理棋子移动"""
+        # 非开发模式：仅允许玩家1在自己回合进行操作，禁止在电脑玩家回合进行任何移动/选择
+        if not self.game_logic.testing_mode and self.game_logic.current_player != Player.PLAYER1:
+            self.status_bar.showMessage("当前为电脑玩家回合，无法操作")
+            self.board_widget.clear_selection()
+            return
         if self.board_widget.selected_position:
             # 已有选中的棋子，尝试移动
             from_pos = self.board_widget.selected_position
+            # 委托棋盘层处理移动及标记的跟随/清除（标记面向棋子）
             if self.game_logic.move_piece(from_pos, position):
                 self.board_widget.clear_selection()
                 self.update_display()
@@ -640,12 +725,12 @@ class GameWindow(QMainWindow):
         else:
             # 选择棋子
             self.select_piece(position)
-    
+
     def select_piece(self, position: Position):
         """选择棋子"""
         cell = self.game_logic.board.get_cell(position)
         if (cell and cell.piece and 
-            (self.game_logic.testing_mode or cell.piece.player == self.game_logic.current_player)):
+            (self.game_logic.testing_mode or (self.game_logic.current_player == Player.PLAYER1 and cell.piece.player == Player.PLAYER1))):
             # 获取可移动位置
             valid_moves = self.get_valid_moves(position)
             self.board_widget.set_selection(position, valid_moves)
@@ -682,10 +767,11 @@ class GameWindow(QMainWindow):
         return valid_moves
     
     def handle_right_click(self, position: Position):
-        """处理右键点击 - 显示标记菜单"""
-        cell = self.game_logic.board.get_cell(position)
-        if cell and cell.piece and cell.piece.player != self.game_logic.current_player:
-            self.show_mark_menu(position)
+        """处理右键点击 - 显示标记菜单（仅在对局阶段，允许标记任何已有棋子）"""
+        if self.game_logic.game_state == GameState.PLAYING:
+            cell = self.game_logic.board.get_cell(position)
+            if cell and cell.piece:
+                self.show_mark_menu(position)
     
     def show_mark_menu(self, position: Position):
         """显示标记菜单"""
@@ -700,9 +786,8 @@ class GameWindow(QMainWindow):
             else:
                 action.triggered.connect(lambda checked, m=mark: self.set_mark(position, m))
         
-        # 在鼠标位置显示菜单
-        menu.exec(self.mapToGlobal(self.board_widget.mapFromParent(
-            self.board_widget.mapFromGlobal(self.cursor().pos()))))
+        # 在鼠标当前位置显示菜单（全局屏幕坐标）
+        menu.exec(QCursor.pos())
     
     def set_mark(self, position: Position, mark: str):
         """设置位置标记"""
@@ -718,6 +803,11 @@ class GameWindow(QMainWindow):
     def start_game(self):
         """开始游戏"""
         if self.game_logic.start_game():
+            # 根据当前开发模式状态同步测试模式与可见性
+            self.game_logic.testing_mode = self.dev_mode
+            for pos, cell in self.game_logic.board.cells.items():
+                if cell.piece:
+                    cell.piece.visible = self.game_logic.testing_mode
             self.update_display()
             QMessageBox.information(self, "游戏开始", "游戏已开始！")
         else:
@@ -745,9 +835,14 @@ class GameWindow(QMainWindow):
         self.board_widget.game_logic = self.game_logic
         self.board_widget.board = self.game_logic.board
         self.board_widget.clear_selection()
+        # 同步开发模式：重置后保持当前开发模式体验
+        self.game_logic.testing_mode = self.dev_mode
+        for pos, cell in self.game_logic.board.cells.items():
+            if cell.piece:
+                cell.piece.visible = self.game_logic.testing_mode
         self.update_display()
         QMessageBox.information(self, "游戏重置", "游戏已重置！")
-    
+
     def auto_layout(self):
         """自动布局当前玩家的棋子"""
         current_player = self.game_logic.current_player
@@ -782,3 +877,164 @@ class GameWindow(QMainWindow):
         is_p1_turn = self.game_logic.current_player == Player.PLAYER1
         self.skip_button.setVisible(in_play and is_p1_turn)
         self.surrender_button.setVisible(in_play and is_p1_turn)
+
+    def toggle_dev_mode(self, checked: bool):
+        """切换开发模式"""
+        self.dev_mode = checked
+        self.game_logic.testing_mode = self.dev_mode
+        # 同步所有棋子可见性
+        for pos, cell in self.game_logic.board.cells.items():
+            if cell.piece:
+                cell.piece.visible = self.game_logic.testing_mode
+        # 切换后刷新显示
+        self.update_display()
+        self.status_bar.showMessage("开发模式：开启" if self.dev_mode else "开发模式：关闭")
+
+    def select_piece(self, position: Position):
+        """选择棋子"""
+        cell = self.game_logic.board.get_cell(position)
+        if (cell and cell.piece and 
+            (self.game_logic.testing_mode or (self.game_logic.current_player == Player.PLAYER1 and cell.piece.player == Player.PLAYER1))):
+            # 获取可移动位置
+            valid_moves = self.get_valid_moves(position)
+            self.board_widget.set_selection(position, valid_moves)
+        else:
+            self.board_widget.clear_selection()
+    
+    def get_valid_moves(self, position: Position) -> list:
+        """获取棋子的有效移动位置"""
+        valid_moves = []
+        
+        # 获取相邻位置
+        adjacent_positions = self.game_logic.board.get_adjacent_positions(position)
+        
+        for adj_pos in adjacent_positions:
+            if self.game_logic.board.can_move(position, adj_pos):
+                valid_moves.append(adj_pos)
+        
+        # 在铁路上：工兵连通拐弯，其它棋子直线行进
+        cell = self.game_logic.board.get_cell(position)
+        if cell and cell.piece and cell.cell_type == CellType.RAILWAY:
+            if cell.piece.is_engineer():
+                railway_positions = self.game_logic.board.get_railway_connected_positions(position)
+                for rail_pos in railway_positions:
+                    if (rail_pos != position and 
+                        self.game_logic.board.can_move(position, rail_pos)):
+                        valid_moves.append(rail_pos)
+            else:
+                straight_positions = self.game_logic.board.get_railway_straight_reachable_positions(position)
+                for rail_pos in straight_positions:
+                    if (rail_pos != position and 
+                        self.game_logic.board.can_move(position, rail_pos)):
+                        valid_moves.append(rail_pos)
+        
+        return valid_moves
+    
+    def handle_right_click(self, position: Position):
+        """处理右键点击 - 显示标记菜单（仅在对局阶段，允许标记任何已有棋子）"""
+        if self.game_logic.game_state == GameState.PLAYING:
+            cell = self.game_logic.board.get_cell(position)
+            if cell and cell.piece:
+                self.show_mark_menu(position)
+    
+    def show_mark_menu(self, position: Position):
+        """显示标记菜单"""
+        menu = QMenu(self)
+        
+        marks = ["司", "军", "师", "旅", "团", "营", "连", "排", "工", "炸", "雷", "旗", "清除"]
+        
+        for mark in marks:
+            action = menu.addAction(mark)
+            if mark == "清除":
+                action.triggered.connect(lambda: self.set_mark(position, ""))
+            else:
+                action.triggered.connect(lambda checked, m=mark: self.set_mark(position, m))
+        
+        # 在鼠标右键点击处显示菜单（全局屏幕坐标）
+        menu.exec(QCursor.pos())
+    
+    def set_mark(self, position: Position, mark: str):
+        """设置位置标记"""
+        if mark:
+            self.game_logic.board.set_mark(position, mark)
+        else:
+            # 清除标记
+            if position in self.game_logic.board.player_marks:
+                del self.game_logic.board.player_marks[position]
+        
+        self.board_widget.update()
+    
+    def start_game(self):
+        """开始游戏"""
+        if self.game_logic.start_game():
+            # 根据当前开发模式状态同步测试模式与可见性
+            self.game_logic.testing_mode = self.dev_mode
+            for pos, cell in self.game_logic.board.cells.items():
+                if cell.piece:
+                    cell.piece.visible = self.game_logic.testing_mode
+            self.update_display()
+            QMessageBox.information(self, "游戏开始", "游戏已开始！")
+        else:
+            QMessageBox.warning(self, "无法开始", "请先完成棋子布局！")
+
+    def skip_turn(self):
+        """跳过当前回合"""
+        if self.game_logic.skip_turn():
+            self.update_display()
+        else:
+            QMessageBox.warning(self, "无法跳过", "当前不在对战阶段。")
+
+    def surrender(self):
+        """投降当前玩家（第一视角：玩家1）"""
+        if self.game_logic.surrender():
+            self.update_display()
+            QMessageBox.information(self, "投降", "已投降，回合切换至下一家。")
+        else:
+            QMessageBox.warning(self, "无法投降", "当前不在对战阶段。")
+    
+    def reset_game(self):
+        """重置游戏"""
+        self.game_logic.reset_game()
+        # 关键：BoardWidget缓存了旧的Board引用，这里需要重绑
+        self.board_widget.game_logic = self.game_logic
+        self.board_widget.board = self.game_logic.board
+        self.board_widget.clear_selection()
+        # 同步开发模式：重置后保持当前开发模式体验
+        self.game_logic.testing_mode = self.dev_mode
+        for pos, cell in self.game_logic.board.cells.items():
+            if cell.piece:
+                cell.piece.visible = self.game_logic.testing_mode
+        self.update_display()
+        QMessageBox.information(self, "游戏重置", "游戏已重置！")
+
+    def auto_layout(self):
+        """自动布局当前玩家的棋子"""
+        current_player = self.game_logic.current_player
+        if self.game_logic.auto_layout_player(current_player):
+            self.update_display()
+            QMessageBox.information(self, "自动布局", f"玩家{current_player.value}的棋子已自动布局完成！")
+        else:
+            QMessageBox.warning(self, "布局失败", "自动布局失败！")
+    
+    def update_display(self):
+        """更新显示"""
+        self.board_widget.update()
+        self.update_status()
+        self._update_play_controls()
+        # 每次刷新后确保居中
+        self._center_board_in_scrollarea()
+    
+    def update_status(self):
+        """更新状态栏"""
+        if self.game_logic.game_state == GameState.SETUP:
+            status = f"布局阶段 - 当前玩家: {self.game_logic.current_player.value}"
+        elif self.game_logic.game_state == GameState.PLAYING:
+            status = f"游戏进行中 - 当前回合: {self.game_logic.current_player.value}（逆时针）"
+        else:
+            status = "游戏结束"
+        
+        self.status_bar.showMessage(status)
+
+# === 全局控制模块（开发模式按钮显示/隐藏）===
+# 修改方法：将 DEV_MODE_BUTTON_VISIBLE 设为 False 可隐藏主界面上的“开发模式”按钮。
+DEV_MODE_BUTTON_VISIBLE = True

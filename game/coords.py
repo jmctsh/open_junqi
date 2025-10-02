@@ -1,3 +1,11 @@
+# -*- coding: utf-8 -*-
+"""
+[已废弃] 坐标工具模块（game/coords.py）
+- 当前项目中已不再引用此模块：scripts/coords_dev_ui.py 已内联实现所需的坐标生成/转换函数；game/board.py 采用硬编码坐标。
+- 为便于后续参考与对照，暂时保留本文件，不建议在新代码中继续使用。
+- 如需删除，请确认无外部脚本依赖后，可直接移除本文件。
+"""
+
 from typing import List, Tuple, Optional
 
 # 统一坐标转换工具：提供玩家区域本地坐标 <-> 全局(row,col) 的转换。
@@ -71,6 +79,7 @@ def row10_east_line() -> List[Tuple[int, int]]:
 
 
 # === 通用坐标转换API ===
+
 def to_global(player: "Player|str", local_row: int, local_col: int) -> Tuple[int, int]:
     """将各阵营本地坐标转换为全局(row,col)。
     - 南(6x5):  (r,c) -> (10+r, 5+c)
