@@ -546,20 +546,34 @@ class Board:
         while q:
             current = q.popleft()
 
-            # 角点跨玩家铁路直连
+            # 角点跨玩家铁路直连（尊重占用：友军阻挡；敌方为终点但不扩展；空格入队）
             corner_links = [
                 (Position(6, 5), Position(5, 6)),  # 西1,1 <-> 北1,5
                 (Position(10, 5), Position(11, 6)),  # 西1,5 <-> 南1,1
                 (Position(11, 10), Position(10, 11)),  # 南1,5 <-> 东1,1
                 (Position(6, 11), Position(5, 10)),  # 东1,5 <-> 北1,1
             ]
+            def try_bridge(to_pos: Position):
+                if to_pos in visited:
+                    return
+                to_cell = self.get_cell(to_pos)
+                if not to_cell or to_cell.cell_type != CellType.RAILWAY:
+                    return
+                visited.add(to_pos)
+                if to_cell.piece:
+                    if start_cell.piece and not self._are_allied(to_cell.piece.player, start_cell.piece.player):
+                        reachable.add(to_pos)
+                    # 无论敌我，都不入队继续扩展
+                    return
+                # 空铁路格：加入可达并继续扩展
+                reachable.add(to_pos)
+                q.append(to_pos)
+
             for a, b in corner_links:
-                if current == a and b not in visited:
-                    q.append(b)
-                    visited.add(b)
-                elif current == b and a not in visited:
-                    q.append(a)
-                    visited.add(a)
+                if current == a:
+                    try_bridge(b)
+                elif current == b:
+                    try_bridge(a)
 
             for adj in self.get_adjacent_positions(current):
                 if adj in visited:
@@ -574,7 +588,7 @@ class Board:
                 # 如果邻接点有棋子
                 if adj_cell.piece:
                     # 如果是敌方棋子，加入可达列表，但不再从此扩展
-                    if start_cell.piece and adj_cell.piece.player != start_cell.piece.player:
+                    if start_cell.piece and not self._are_allied(adj_cell.piece.player, start_cell.piece.player):
                         reachable.add(adj)
                     # 不论敌我，都不能穿越，故不加入队列
                     continue
@@ -694,7 +708,7 @@ class Board:
             if not cell or cell.cell_type != CellType.RAILWAY:
                 return True, False
             if cell.piece:
-                if start_cell.piece and cell.piece.player != start_cell.piece.player:
+                if start_cell.piece and not self._are_allied(cell.piece.player, start_cell.piece.player):
                     reachable.add(next_pos)
                     return True, True
                 return True, False
@@ -802,8 +816,8 @@ class Board:
         if piece.is_mine() or piece.is_flag():
             return False
         
-        # 目标位置不能有己方棋子
-        if to_cell.piece and to_cell.piece.player == piece.player:
+        # 目标位置不能有友方（含己方）棋子
+        if to_cell.piece and self._are_allied(to_cell.piece.player, piece.player):
             return False
         
         # 行营内的棋子不能被攻击，但可以移出
@@ -929,7 +943,14 @@ class Board:
             return None  # 同归于尽
     
     def is_game_over(self) -> bool:
-        """检查游戏是否结束"""
+        """检查游戏是否结束：当一队两个玩家全部阵亡时结束（南+北 或 东+西）"""
+        alive: Set[Player] = set()
+        for cell in self.cells.values():
+            if cell.piece:
+                alive.add(cell.piece.player)
+        south_north_dead = (Player.PLAYER1 not in alive) and (Player.PLAYER3 not in alive)
+        east_west_dead = (Player.PLAYER2 not in alive) and (Player.PLAYER4 not in alive)
+        return south_north_dead or east_west_dead
         flags_remaining = 0
         for cell in self.cells.values():
             if cell.piece and cell.piece.is_flag():
@@ -956,8 +977,35 @@ class Board:
             return {Player.PLAYER1, Player.PLAYER3}
         else:
             return {Player.PLAYER2, Player.PLAYER4}
+    def _are_allied(self, a: Player, b: Player) -> bool:
+        """判断两名玩家是否为同一队（南+北；东+西）"""
+        return a in self._get_axis_players(b)
     def _reveal_flags_for_players(self, players: Set[Player]) -> None:
         """将指定玩家集合的军旗设置为可见"""
         for cell in self.cells.values():
             if cell.piece and cell.piece.is_flag() and cell.piece.player in players:
                 cell.piece.visible = True
+
+    def has_player_any_legal_move(self, player: Player) -> bool:
+        """检查指定玩家是否存在至少一个合法走法（考虑总部禁动、地雷/军旗不可动、铁路规则与友军阻挡）"""
+        # 遍历该玩家的所有棋子
+        for cell in self.cells.values():
+            if not cell.piece or cell.piece.player != player:
+                continue
+            # 快速跳过不可移动的起点
+            if cell.cell_type == CellType.HEADQUARTERS or cell.piece.is_mine() or cell.piece.is_flag():
+                continue
+            from_pos = cell.position
+            # 收集候选目的地
+            if cell.cell_type == CellType.RAILWAY:
+                if cell.piece.is_engineer():
+                    candidates = self.get_railway_connected_positions(from_pos)
+                else:
+                    candidates = self.get_railway_straight_reachable_positions(from_pos)
+            else:
+                candidates = set(self.get_adjacent_positions(from_pos))
+            # 只要存在一个 can_move 成立的目的地，即认为该玩家有可动子
+            for to_pos in candidates:
+                if self.can_move(from_pos, to_pos):
+                    return True
+        return False

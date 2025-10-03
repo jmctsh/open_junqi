@@ -225,12 +225,14 @@ class GameLogic:
                         if cell.piece and cell.piece.player == defender_flag_owner:
                             cell.piece = None
 
-            # 若只剩一个军旗，立即结束；否则正常切换
-            if self.board.is_game_over():
+            # 更新淘汰状态：无子或无任何合法走法者立即淘汰
+            self._ensure_elimination_status()
+            # 轴队判负：南北同亡或东西同亡即结束
+            south_north_eliminated = (Player.PLAYER1 in self.eliminated_players) and (Player.PLAYER3 in self.eliminated_players)
+            east_west_eliminated = (Player.PLAYER2 in self.eliminated_players) and (Player.PLAYER4 in self.eliminated_players)
+            if self.board.is_game_over() or south_north_eliminated or east_west_eliminated:
                 self.game_state = GameState.FINISHED
             else:
-                # 战斗后可能有人已无子或军旗被吃，更新淘汰状态
-                self._ensure_elimination_status()
                 self._next_turn()
             return True
         return False
@@ -342,12 +344,17 @@ class GameLogic:
         for position, cell in self.board.cells.items():
             if cell.piece and cell.piece.player == loser:
                 cell.piece = None
-        # 若因此只剩一个军旗（或更少），直接结束
-        if self.board.is_game_over():
+        # 标记淘汰
+        self.eliminated_players.add(loser)
+        # 立即同步淘汰状态：无子或无任何合法走法者加入淘汰
+        self._ensure_elimination_status()
+        # 队伍判负：南+北 或 东+西 同亡
+        south_north_eliminated = (Player.PLAYER1 in self.eliminated_players) and (Player.PLAYER3 in self.eliminated_players)
+        east_west_eliminated = (Player.PLAYER2 in self.eliminated_players) and (Player.PLAYER4 in self.eliminated_players)
+        if self.board.is_game_over() or south_north_eliminated or east_west_eliminated:
             self.game_state = GameState.FINISHED
             return True
-        # 标记淘汰并切换到下一位未淘汰玩家
-        self.eliminated_players.add(loser)
+        # 未结束则切换到下一位未淘汰玩家
         self._next_turn()
         return True
     
@@ -378,11 +385,25 @@ class GameLogic:
 
     # === 辅助：同步淘汰状态 ===
     def _ensure_elimination_status(self) -> None:
-        """检查各玩家是否已无子，若无则加入淘汰列表"""
+        """检查各玩家是否已无子或已无任何可移动的子，若满足其一则加入淘汰列表（立即生效）"""
         remaining: Dict[Player, int] = {p: 0 for p in Player}
         for cell in self.board.cells.values():
             if cell.piece:
                 remaining[cell.piece.player] += 1
         for p, count in remaining.items():
             if count == 0:
-                self.eliminated_players.add(p)
+                # 无子：标记淘汰并清空棋子（幂等，实际无子不产生变化）
+                if p not in self.eliminated_players:
+                    self.eliminated_players.add(p)
+                    for position, cell in self.board.cells.items():
+                        if cell.piece and cell.piece.player == p:
+                            cell.piece = None
+            else:
+                # 有子但可能均不可移动：检查是否存在至少一个合法走法
+                if not self.board.has_player_any_legal_move(p):
+                    if p not in self.eliminated_players:
+                        self.eliminated_players.add(p)
+                        # 与军旗被吃一致：立即清除该玩家所有棋子
+                        for position, cell in self.board.cells.items():
+                            if cell.piece and cell.piece.player == p:
+                                cell.piece = None

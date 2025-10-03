@@ -326,45 +326,48 @@ class BoardWidget(QWidget):
         polygon = QPolygon([QPoint(x, y) for x, y in points])
         painter.drawPolygon(polygon)
 
-    # 新增：在棋子右下角绘制战绩标记（1杀“^”、2杀上下“^ ^”、3及以上为小星）
+    # 新增：在棋子右下角绘制战绩标记（1/2杀“^”、3及以上为小星），颜色高饱和度洋红色
     def _draw_kill_marks(self, painter, cell_top_left_x: int, cell_top_left_y: int, piece):
         kill_count = getattr(piece, 'kill_count', 0)
         if kill_count <= 0:
             return
-        padding = 3
-        overlay_w = max(12, self.cell_size // 4)
-        overlay_h = max(12, self.cell_size // 4)
+        magenta = QColor(255, 0, 255)  # 与红/蓝/绿/橙明显区分的高饱和色
+        # 右下角叠加区域：更贴近右下角，尽量不遮挡中央文字
+        padding = max(1, self.cell_size // 40)
+        overlay_w = max(16, int(self.cell_size * 0.42))
+        overlay_h = max(16, int(self.cell_size * 0.42))
         rect = QRect(
             cell_top_left_x + self.cell_size - overlay_w - padding,
             cell_top_left_y + self.cell_size - overlay_h - padding,
             overlay_w,
             overlay_h
         )
-        if kill_count == 1:
-            # 单杀：右下角一个“^”
-            mark_font = QFont("SimHei", max(8, self.cell_size // 7), QFont.Weight.Bold)
-            painter.setFont(mark_font)
-            painter.setPen(QPen(QColor(255, 255, 255)))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "^")
-        elif kill_count == 2:
-            # 双杀：上下紧凑排列两个“^”
-            mark_font = QFont("SimHei", max(7, self.cell_size // 8), QFont.Weight.Bold)
-            painter.setFont(mark_font)
-            painter.setPen(QPen(QColor(255, 255, 255)))
-            half_h = rect.height() // 2
-            rect_top = QRect(rect.left(), rect.top(), rect.width(), half_h)
-            rect_bottom = QRect(rect.left(), rect.top() + half_h - 1, rect.width(), half_h)
-            painter.drawText(rect_top, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "^")
-            painter.drawText(rect_bottom, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "^")
-        else:
-            # 三杀及以上：右下角小金色五角星
-            star_size = max(4, self.cell_size // 10)
-            center_x = cell_top_left_x + self.cell_size - star_size - padding
-            center_y = cell_top_left_y + self.cell_size - star_size - padding
-            painter.setPen(QPen(QColor(255, 215, 0), 2))
-            painter.setBrush(QBrush(QColor(255, 215, 0, 220)))
+        if kill_count >= 3:
+            # 三杀及以上：小五角星（洋红色），更贴近右下角（整体再小一号）
+            star_size = max(7, int(self.cell_size * 0.12))
+            center_x = rect.right() - star_size // 2
+            center_y = rect.bottom() - star_size // 2
+            painter.setPen(QPen(magenta, 2))
+            painter.setBrush(QBrush(QColor(255, 0, 255, 220)))
             self._draw_star(painter, center_x, center_y, star_size)
-
+        else:
+            # 1/2杀：改用矢量绘制“^”，锚定右下角，略微缩小以提升协调性
+            stroke_w = max(2, int(self.cell_size * 0.04))
+            margin = max(1, int(self.cell_size * 0.04))
+            length = max(10, int(self.cell_size * 0.28))
+            height = max(6, int(length * 0.52))
+            anchor_x = cell_top_left_x + self.cell_size - margin  # 右边界内缩
+            anchor_y = cell_top_left_y + self.cell_size - margin  # 下边界内缩
+            left_x = anchor_x - length
+            right_x = anchor_x
+            apex_x = anchor_x - length // 2
+            apex_y = anchor_y - height
+            pen = QPen(magenta, stroke_w)
+            painter.setPen(pen)
+            painter.drawLine(left_x, anchor_y, apex_x, apex_y)
+            painter.drawLine(apex_x, apex_y, right_x, anchor_y)
+        # ... existing code ...
+    
     def _draw_pieces(self, painter):
         """绘制棋子"""
         font = QFont("SimHei", 10, QFont.Weight.Bold)
@@ -405,7 +408,7 @@ class BoardWidget(QWidget):
         """获取玩家颜色"""
         colors = {
             Player.PLAYER1: QColor(255, 0, 0),    # 红色
-            Player.PLAYER2: QColor(0, 0, 255),    # 蓝色  
+            Player.PLAYER2: QColor(135, 206, 250),    # 淡蓝色（原为深蓝色）
             Player.PLAYER3: QColor(0, 128, 0),    # 绿色
             Player.PLAYER4: QColor(255, 165, 0),  # 橙色
         }
