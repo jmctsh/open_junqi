@@ -37,6 +37,8 @@ class Piece:
     player: Player
     visible: bool = False  # 是否对其他玩家可见
     kill_count: int = 0    # 战绩：累计击杀数
+    # 为LLM交互添加：唯一棋子ID（如 south_001 / north_023），在开始游戏时统一分配
+    piece_id: Optional[str] = None
     
     def __str__(self):
         return f"{self.player.name}的{self.piece_type.value}"

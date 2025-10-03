@@ -1,16 +1,19 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 四国军棋游戏主窗口
 """
 
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QLabel, QStatusBar, QMessageBox, QMenu, QScrollArea)
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QSize, QTimer
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QMouseEvent, QCursor
+                             QPushButton, QLabel, QStatusBar, QMessageBox, QMenu, QComboBox, QLineEdit, QSizePolicy)
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QSize, QPoint
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QMouseEvent, QCursor, QPixmap, QPolygon
 from .game_logic import GameLogic, GameState
 from .board import Position, CellType
 from .piece import Player
+import os
+import random
+
+from .ws_client import WSClient
 
 class BoardWidget(QWidget):
     """棋盘渲染组件"""
@@ -29,6 +32,10 @@ class BoardWidget(QWidget):
         self.cell_size = 30  # 格子大小
         self.cell_spacing = 10  # 格子间距
         self.margin = 60
+        # 记录基础尺寸，便于缩放
+        self.base_cell_size = self.cell_size
+        self.base_cell_spacing = self.cell_spacing
+        self.base_margin = self.margin
         
         # 计算总尺寸
         self.total_width = self.board.cols * (self.cell_size + self.cell_spacing) + 2 * self.margin
@@ -38,6 +45,21 @@ class BoardWidget(QWidget):
     def sizeHint(self) -> QSize:
         """为滚动区域提供内容的理想尺寸，以便正确居中"""
         return QSize(self.total_width, self.total_height)
+    
+    def recalc_dimensions(self):
+        """依据当前显示参数重新计算尺寸"""
+        self.total_width = self.board.cols * (self.cell_size + self.cell_spacing) + 2 * self.margin
+        self.total_height = self.board.rows * (self.cell_size + self.cell_spacing) + 2 * self.margin
+        self.setMinimumSize(self.total_width, self.total_height)
+    
+    def set_scale_factor(self, f: float):
+        """按比例缩放棋盘显示参数，限制最大为1.0，最小为0.3"""
+        f = max(0.3, min(1.0, f))
+        self.cell_size = int(self.base_cell_size * f)
+        self.cell_spacing = int(self.base_cell_spacing * f)
+        self.margin = int(self.base_margin * f)
+        self.recalc_dimensions()
+        self.update()
     
     def paintEvent(self, event):
         """绘制棋盘"""
@@ -293,8 +315,7 @@ class BoardWidget(QWidget):
                     (center_x - triangle_size, center_y + triangle_size),
                     (center_x + triangle_size, center_y + triangle_size)
                 ]
-                from PyQt6.QtGui import QPolygon
-                from PyQt6.QtCore import QPoint
+                
                 polygon = QPolygon([QPoint(x, y) for x, y in points])
                 painter.drawPolygon(polygon)
                 
@@ -321,8 +342,7 @@ class BoardWidget(QWidget):
                 y = center_y + size * 0.4 * math.sin(angle - math.pi / 2)
             points.append((int(x), int(y)))
         
-        from PyQt6.QtGui import QPolygon
-        from PyQt6.QtCore import QPoint
+        
         polygon = QPolygon([QPoint(x, y) for x, y in points])
         painter.drawPolygon(polygon)
 
@@ -366,7 +386,6 @@ class BoardWidget(QWidget):
             painter.setPen(pen)
             painter.drawLine(left_x, anchor_y, apex_x, apex_y)
             painter.drawLine(apex_x, apex_y, right_x, anchor_y)
-        # ... existing code ...
     
     def _draw_pieces(self, painter):
         """绘制棋子"""
@@ -545,18 +564,50 @@ class BoardWidget(QWidget):
 
 class GameWindow(QMainWindow):
     """游戏主窗口"""
+    ws_connected = pyqtSignal()
+    ws_error = pyqtSignal(str)
+    chat_message_received = pyqtSignal(dict)
+    chat_received_ack = pyqtSignal(dict)
     
     def __init__(self):
         super().__init__()
         self.game_logic = GameLogic()
         # 开发模式开关（默认关闭）
         self.dev_mode: bool = False
+        # 初始化我方与三家AI的人物与席位分配数据结构（需在 UI 创建前准备）
+        self.me_name = "saki"
+        self.me_name_edit = None
+        self.seat_combos = {}
+        self.seat_name_labels = {}
+        self.seat_avatar_labels = {}
+        # 三个AI席位默认随机分配（仅对非我方位置）
+        self.seat_assignments = {
+            Player.PLAYER2: "random",
+            Player.PLAYER3: "random",
+            Player.PLAYER4: "random",
+        }
+        # 加载AI人物资源与名称映射
+        self._init_personas()
+        
+        # WebSocket 客户端相关（解耦为 WSClient）
+        self.WS_URL = "ws://localhost:8765"
+        self.ws_client = None
+        self.ws_connected_flag = False
+        
+        # 聊天控件与状态
+        self.me_chat_input = None
+        self.me_chat_send_btn = None
+        self.chat_locked = False
+        
+        # 头像定位参数
+        self.avatar_frames = {}
+        self.avatar_padding = 48
         self.setup_ui()
         self.connect_signals()
         # 启动时自动布局四方后刷新显示
         self.update_display()
-        # 初始居中棋盘
-        self._center_board_in_scrollarea()
+        # 初始布局棋盘与头像
+        self._layout_play_area()
     
     def setup_ui(self):
         """设置用户界面"""
@@ -567,42 +618,59 @@ class GameWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # 创建布局
+        # 主布局（垂直），其中包含一个棋盘+头像框的网格容器
         main_layout = QVBoxLayout(central_widget)
+        # 去除默认边距和间距，使居中更准确
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
         
         # 创建状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.update_status()
         
-        # 创建棋盘组件并放入可滚动区域，居中显示以适配窗口变化
+        # 播放区域：承载棋盘与头像框，采用绝对定位
         self.board_widget = BoardWidget(self.game_logic)
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidget(self.board_widget)
-        # 固定内容尺寸，避免填满视口导致无法居中
-        self.scroll_area.setWidgetResizable(False)
-        self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main_layout.addWidget(self.scroll_area)
+        self.play_area = QWidget()
+        # 允许缩小到较小尺寸以触发自适应缩放
+        self.play_area.setMinimumSize(QSize(200, 200))
+        # 扩展以占据可用空间
+        self.play_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # 棋盘作为播放区域子控件
+        self.board_widget.setParent(self.play_area)
         
-        # 创建控制按钮
+        # 创建四个头像框并设置为播放区域子控件
+        top_frame = self._create_avatar_frame(Player.PLAYER3)
+        top_frame.setParent(self.play_area)
+        left_frame = self._create_avatar_frame(Player.PLAYER2)
+        left_frame.setParent(self.play_area)
+        right_frame = self._create_avatar_frame(Player.PLAYER4)
+        right_frame.setParent(self.play_area)
+        bottom_frame = self._create_avatar_frame(Player.PLAYER1, is_me=True)
+        bottom_frame.setParent(self.play_area)
+        
+        # 保存映射以便定位
+        self.avatar_frames = {
+            Player.PLAYER1: bottom_frame,
+            Player.PLAYER3: top_frame,
+            Player.PLAYER2: left_frame,
+            Player.PLAYER4: right_frame,
+        }
+        
+        # 将播放区域加入主布局
+        main_layout.addWidget(self.play_area, stretch=1)
+        
+        # 控制按钮区
         button_layout = QHBoxLayout()
-        
-        # 开发模式按钮（可开关）：允许显示全局上帝视角、操作所有棋子、显示坐标
         self.dev_mode_button = QPushButton("开发模式")
         self.dev_mode_button.setCheckable(True)
         self.dev_mode_button.setChecked(self.dev_mode)
-        # 通过底部全局控制模块决定是否显示按钮
-        try:
-            self.dev_mode_button.setVisible(DEV_MODE_BUTTON_VISIBLE)
-        except NameError:
-            # 若全局控制未定义，默认显示
-            self.dev_mode_button.setVisible(True)
+        self.dev_mode_button.setVisible(DEV_MODE_BUTTON_VISIBLE)
         button_layout.addWidget(self.dev_mode_button)
         
         self.start_button = QPushButton("开始游戏")
         self.reset_button = QPushButton("重置游戏")
         self.auto_layout_button = QPushButton("自动布局")
-        # 跳过与投降按钮：与其他按钮平行，位于右下角（伸展后）
         self.skip_button = QPushButton("跳过回合")
         self.surrender_button = QPushButton("投降")
         
@@ -616,33 +684,14 @@ class GameWindow(QMainWindow):
         main_layout.addLayout(button_layout)
 
     def showEvent(self, event):
-        """窗口显示时，居中滚动内容"""
+        """窗口显示时，居中棋盘并定位头像"""
         super().showEvent(event)
-        self._center_board_in_scrollarea()
+        self._layout_play_area()
 
     def resizeEvent(self, event):
-        """窗口尺寸变化时，保持棋盘居中"""
+        """窗口尺寸变化时，保持棋盘居中并重新定位头像"""
         super().resizeEvent(event)
-        self._center_board_in_scrollarea()
-
-    def _center_board_in_scrollarea(self):
-        """将滚动区域视口中心对齐棋盘"""
-        if not hasattr(self, 'scroll_area') or self.scroll_area is None:
-            return
-        sa = self.scroll_area
-        widget = sa.widget()
-        vp = sa.viewport()
-        if not widget or not vp:
-            return
-        hbar = sa.horizontalScrollBar()
-        vbar = sa.verticalScrollBar()
-        h_offset = max(widget.width() - vp.width(), 0) // 2
-        v_offset = max(widget.height() - vp.height(), 0) // 2
-        # 延迟到布局更新后再居中，确保滚动条范围已计算
-        def apply_center():
-            hbar.setValue(h_offset)
-            vbar.setValue(v_offset)
-        QTimer.singleShot(0, apply_center)
+        self._layout_play_area()
 
     def connect_signals(self):
         """连接信号和槽"""
@@ -653,8 +702,18 @@ class GameWindow(QMainWindow):
         self.auto_layout_button.clicked.connect(self.auto_layout)
         self.skip_button.clicked.connect(self.skip_turn)
         self.surrender_button.clicked.connect(self.surrender)
-        # 开发模式按钮开关：动态切换坐标显示与棋子权限/可见性
         self.dev_mode_button.toggled.connect(self.toggle_dev_mode)
+        # 头像选择下拉事件
+        for seat, combo in self.seat_combos.items():
+            combo.currentTextChanged.connect(lambda _text, s=seat: self._on_seat_selection_changed(s))
+        # 聊天发送按钮
+        if self.me_chat_send_btn:
+            self.me_chat_send_btn.clicked.connect(self._on_send_chat_clicked)
+        # WebSocket 事件信号
+        self.ws_connected.connect(self._on_ws_connected)
+        self.ws_error.connect(lambda msg: self.status_bar.showMessage(f"WS错误：{msg}"))
+        self.chat_received_ack.connect(self._on_chat_received_ack)
+        self.chat_message_received.connect(self._on_chat_message_broadcast)
 
     def on_cell_clicked(self, row: int, col: int, button: int):
         """处理格子点击事件"""
@@ -707,172 +766,6 @@ class GameWindow(QMainWindow):
         else:
             self.board_widget.clear_selection()
             QMessageBox.warning(self, "非法调整", "该位置不符合布局规则，已恢复。")
-
-    def handle_piece_move(self, position: Position):
-        """处理棋子移动"""
-        # 非开发模式：仅允许玩家1在自己回合进行操作，禁止在电脑玩家回合进行任何移动/选择
-        if not self.game_logic.testing_mode and self.game_logic.current_player != Player.PLAYER1:
-            self.status_bar.showMessage("当前为电脑玩家回合，无法操作")
-            self.board_widget.clear_selection()
-            return
-        if self.board_widget.selected_position:
-            # 已有选中的棋子，尝试移动
-            from_pos = self.board_widget.selected_position
-            # 委托棋盘层处理移动及标记的跟随/清除（标记面向棋子）
-            if self.game_logic.move_piece(from_pos, position):
-                self.board_widget.clear_selection()
-                self.update_display()
-            else:
-                # 移动失败，重新选择
-                self.select_piece(position)
-        else:
-            # 选择棋子
-            self.select_piece(position)
-
-    def select_piece(self, position: Position):
-        """选择棋子"""
-        cell = self.game_logic.board.get_cell(position)
-        if (cell and cell.piece and 
-            (self.game_logic.testing_mode or (self.game_logic.current_player == Player.PLAYER1 and cell.piece.player == Player.PLAYER1))):
-            # 获取可移动位置
-            valid_moves = self.get_valid_moves(position)
-            self.board_widget.set_selection(position, valid_moves)
-        else:
-            self.board_widget.clear_selection()
-    
-    def get_valid_moves(self, position: Position) -> list:
-        """获取棋子的有效移动位置"""
-        valid_moves = []
-        
-        # 获取相邻位置
-        adjacent_positions = self.game_logic.board.get_adjacent_positions(position)
-        
-        for adj_pos in adjacent_positions:
-            if self.game_logic.board.can_move(position, adj_pos):
-                valid_moves.append(adj_pos)
-        
-        # 在铁路上：工兵连通拐弯，其它棋子直线行进
-        cell = self.game_logic.board.get_cell(position)
-        if cell and cell.piece and cell.cell_type == CellType.RAILWAY:
-            if cell.piece.is_engineer():
-                railway_positions = self.game_logic.board.get_railway_connected_positions(position)
-                for rail_pos in railway_positions:
-                    if (rail_pos != position and 
-                        self.game_logic.board.can_move(position, rail_pos)):
-                        valid_moves.append(rail_pos)
-            else:
-                straight_positions = self.game_logic.board.get_railway_straight_reachable_positions(position)
-                for rail_pos in straight_positions:
-                    if (rail_pos != position and 
-                        self.game_logic.board.can_move(position, rail_pos)):
-                        valid_moves.append(rail_pos)
-        
-        return valid_moves
-    
-    def handle_right_click(self, position: Position):
-        """处理右键点击 - 显示标记菜单（仅在对局阶段，允许标记任何已有棋子）"""
-        if self.game_logic.game_state == GameState.PLAYING:
-            cell = self.game_logic.board.get_cell(position)
-            if cell and cell.piece:
-                self.show_mark_menu(position)
-    
-    def show_mark_menu(self, position: Position):
-        """显示标记菜单"""
-        menu = QMenu(self)
-        
-        marks = ["司", "军", "师", "旅", "团", "营", "连", "排", "工", "炸", "雷", "旗", "清除"]
-        
-        for mark in marks:
-            action = menu.addAction(mark)
-            if mark == "清除":
-                action.triggered.connect(lambda: self.set_mark(position, ""))
-            else:
-                action.triggered.connect(lambda checked, m=mark: self.set_mark(position, m))
-        
-        # 在鼠标当前位置显示菜单（全局屏幕坐标）
-        menu.exec(QCursor.pos())
-    
-    def set_mark(self, position: Position, mark: str):
-        """设置位置标记"""
-        if mark:
-            self.game_logic.board.set_mark(position, mark)
-        else:
-            # 清除标记
-            if position in self.game_logic.board.player_marks:
-                del self.game_logic.board.player_marks[position]
-        
-        self.board_widget.update()
-    
-    def start_game(self):
-        """开始游戏"""
-        if self.game_logic.start_game():
-            # 根据当前开发模式状态同步测试模式与可见性
-            self.game_logic.testing_mode = self.dev_mode
-            for pos, cell in self.game_logic.board.cells.items():
-                if cell.piece:
-                    cell.piece.visible = self.game_logic.testing_mode
-            self.update_display()
-            QMessageBox.information(self, "游戏开始", "游戏已开始！")
-        else:
-            QMessageBox.warning(self, "无法开始", "请先完成棋子布局！")
-
-    def skip_turn(self):
-        """跳过当前回合"""
-        if self.game_logic.skip_turn():
-            self.update_display()
-        else:
-            QMessageBox.warning(self, "无法跳过", "当前不在对战阶段。")
-
-    def surrender(self):
-        """投降当前玩家（第一视角：玩家1）"""
-        if self.game_logic.surrender():
-            self.update_display()
-            QMessageBox.information(self, "投降", "已投降，回合切换至下一家。")
-        else:
-            QMessageBox.warning(self, "无法投降", "当前不在对战阶段。")
-    
-    def reset_game(self):
-        """重置游戏"""
-        self.game_logic.reset_game()
-        # 关键：BoardWidget缓存了旧的Board引用，这里需要重绑
-        self.board_widget.game_logic = self.game_logic
-        self.board_widget.board = self.game_logic.board
-        self.board_widget.clear_selection()
-        # 同步开发模式：重置后保持当前开发模式体验
-        self.game_logic.testing_mode = self.dev_mode
-        for pos, cell in self.game_logic.board.cells.items():
-            if cell.piece:
-                cell.piece.visible = self.game_logic.testing_mode
-        self.update_display()
-        QMessageBox.information(self, "游戏重置", "游戏已重置！")
-
-    def auto_layout(self):
-        """自动布局当前玩家的棋子"""
-        current_player = self.game_logic.current_player
-        if self.game_logic.auto_layout_player(current_player):
-            self.update_display()
-            QMessageBox.information(self, "自动布局", f"玩家{current_player.value}的棋子已自动布局完成！")
-        else:
-            QMessageBox.warning(self, "布局失败", "自动布局失败！")
-    
-    def update_display(self):
-        """更新显示"""
-        self.board_widget.update()
-        self.update_status()
-        self._update_play_controls()
-        # 每次刷新后确保居中
-        self._center_board_in_scrollarea()
-    
-    def update_status(self):
-        """更新状态栏"""
-        if self.game_logic.game_state == GameState.SETUP:
-            status = f"布局阶段 - 当前玩家: {self.game_logic.current_player.value}"
-        elif self.game_logic.game_state == GameState.PLAYING:
-            status = f"游戏进行中 - 当前回合: {self.game_logic.current_player.value}（逆时针）"
-        else:
-            status = "游戏结束"
-        
-        self.status_bar.showMessage(status)
 
     def _update_play_controls(self):
         """根据状态控制跳过与投降按钮（第一视角：玩家1）"""
@@ -970,12 +863,36 @@ class GameWindow(QMainWindow):
     def start_game(self):
         """开始游戏"""
         if self.game_logic.start_game():
+            # 开始前为随机席位分配唯一AI人物
+            self.finalize_ai_assignments()
             # 根据当前开发模式状态同步测试模式与可见性
             self.game_logic.testing_mode = self.dev_mode
             for pos, cell in self.game_logic.board.cells.items():
                 if cell.piece:
                     cell.piece.visible = self.game_logic.testing_mode
+            # 锁定角色选择与玩家名编辑：隐藏下拉并禁用编辑
+            for combo in self.seat_combos.values():
+                combo.setVisible(False)
+                combo.setEnabled(False)
+            if self.me_name_edit:
+                self.me_name_edit.setReadOnly(True)
             self.update_display()
+            # 启动WebSocket客户端，待连接成功后将发送 start_game
+            if not self.ws_client:
+                self.ws_client = WSClient(
+                    self.WS_URL,
+                    on_connected=lambda: self.ws_connected.emit(),
+                    on_error=lambda msg: self.ws_error.emit(msg),
+                    on_chat_received=lambda d: self.chat_received_ack.emit(d),
+                    on_chat_message=lambda d: self.chat_message_received.emit(d),
+                    on_message=lambda d: None
+                )
+                self.ws_client.start()
+            # 进入对战阶段：允许输入聊天文本，发送按钮在连接建立前保持禁用
+            if self.me_chat_input:
+                self.me_chat_input.setEnabled(True)
+            if self.me_chat_send_btn:
+                self.me_chat_send_btn.setEnabled(False)
             QMessageBox.information(self, "游戏开始", "游戏已开始！")
         else:
             QMessageBox.warning(self, "无法开始", "请先完成棋子布局！")
@@ -998,6 +915,28 @@ class GameWindow(QMainWindow):
     def reset_game(self):
         """重置游戏"""
         self.game_logic.reset_game()
+        # 恢复AI席位分配为随机
+        self.seat_assignments = {
+            Player.PLAYER2: "random",
+            Player.PLAYER3: "random",
+            Player.PLAYER4: "random",
+        }
+        # 重新刷新下拉与名称显示
+        self._refresh_persona_options()
+        for seat, label in self.seat_name_labels.items():
+            label.setText("随机")
+        # 清空随机席位的头像（刷新下拉时阻断了信号，未触发头像清空）
+        for seat, avatar_label in self.seat_avatar_labels.items():
+            if self.seat_assignments.get(seat) == "random" and avatar_label:
+                avatar_label.clear()
+        # 重新显示并启用下拉，允许布局阶段选择
+        for combo in self.seat_combos.values():
+            combo.setVisible(True)
+            combo.setEnabled(True)
+        # 玩家名恢复可编辑
+        if self.me_name_edit:
+            self.me_name_edit.setReadOnly(False)
+            self.me_name_edit.setEnabled(True)
         # 关键：BoardWidget缓存了旧的Board引用，这里需要重绑
         self.board_widget.game_logic = self.game_logic
         self.board_widget.board = self.game_logic.board
@@ -1007,6 +946,14 @@ class GameWindow(QMainWindow):
         for pos, cell in self.game_logic.board.cells.items():
             if cell.piece:
                 cell.piece.visible = self.game_logic.testing_mode
+        # 重新显示头像框并重新定位
+        for frame in self.avatar_frames.values():
+            frame.setVisible(True)
+        # 恢复我方名字输入框样式（黑色、居中、半粗）
+        if self.me_name_edit:
+            self.me_name_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.me_name_edit.setStyleSheet("color: #000000; font-weight: 500;")
+        self._layout_play_area()
         self.update_display()
         QMessageBox.information(self, "游戏重置", "游戏已重置！")
 
@@ -1024,20 +971,356 @@ class GameWindow(QMainWindow):
         self.board_widget.update()
         self.update_status()
         self._update_play_controls()
-        # 每次刷新后确保居中
-        self._center_board_in_scrollarea()
+        # 每次刷新后确保居中并定位头像
+        self._layout_play_area()
     
     def update_status(self):
-        """更新状态栏"""
+        """更新状态栏，并根据阶段更新聊天控件可用性"""
         if self.game_logic.game_state == GameState.SETUP:
             status = f"布局阶段 - 当前玩家: {self.game_logic.current_player.value}"
+            # 布局阶段：禁用聊天输入与发送
+            if self.me_chat_input:
+                self.me_chat_input.setEnabled(False)
+            if self.me_chat_send_btn:
+                self.me_chat_send_btn.setEnabled(False)
         elif self.game_logic.game_state == GameState.PLAYING:
             status = f"游戏进行中 - 当前回合: {self.game_logic.current_player.value}（逆时针）"
+            # 对战阶段：允许输入文本，发送按钮随WS连接状态与锁定标记
+            if self.me_chat_input:
+                self.me_chat_input.setEnabled(True)
+            if self.me_chat_send_btn:
+                self.me_chat_send_btn.setEnabled(self.ws_connected_flag and not self.chat_locked)
         else:
             status = "游戏结束"
+            # 结束阶段：禁用聊天输入与发送
+            if self.me_chat_input:
+                self.me_chat_input.setEnabled(False)
+            if self.me_chat_send_btn:
+                self.me_chat_send_btn.setEnabled(False)
         
         self.status_bar.showMessage(status)
 
-# === 全局控制模块（开发模式按钮显示/隐藏）===
-# 修改方法：将 DEV_MODE_BUTTON_VISIBLE 设为 False 可隐藏主界面上的“开发模式”按钮。
-DEV_MODE_BUTTON_VISIBLE = True
+    # === 全局控制模块（开发模式按钮显示/隐藏）===
+    # 修改方法：将 DEV_MODE_BUTTON_VISIBLE 设为 False 可隐藏主界面上的“开发模式”按钮。
+    # DEV_MODE_BUTTON_VISIBLE 的全局定义已移动到文件末尾统一管理
+
+    def _init_personas(self):
+        """初始化三家AI人物信息与资源路径。"""
+        assets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets"))
+        self.personas = {
+            "player1": {"name": "外卖剩一半", "avatar": os.path.join(assets_dir, "player_1.png")},
+            "player2": {"name": "旧刊夹页", "avatar": os.path.join(assets_dir, "player_2.png")},
+            "player3": {"name": "老陈夜茶凉", "avatar": os.path.join(assets_dir, "player_3.png")},
+        }
+        self.me_avatar_path = os.path.join(assets_dir, "player_me.jpg")
+        # 当前未被占用的候选池（用于随机）
+        self.available_personas = set(self.personas.keys())
+        # 名称到键的反查
+        self._persona_name_to_key = {v["name"]: k for k, v in self.personas.items()}
+    
+    def _create_avatar_frame(self, seat: Player, is_me: bool = False) -> QWidget:
+        """创建头像框组件，包含头像与姓名显示；AI席位附带选择下拉。"""
+        frame = QWidget()
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+        # 头像
+        avatar_label = QLabel()
+        avatar_label.setFixedSize(96, 96)
+        avatar_label.setStyleSheet("border: 1px solid #cccccc; border-radius: 4px;")
+        avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # 姓名：我方可编辑，其余显示为当前选择/随机
+        if is_me:
+            name_edit = QLineEdit(self.me_name)
+            name_edit.setPlaceholderText("点击修改你的名字")
+            name_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_edit.setStyleSheet("color: #000000; font-weight: 500;")
+            name_edit.textChanged.connect(lambda text: setattr(self, "me_name", text))
+            self.me_name_edit = name_edit
+            # 加载我方头像
+            pix = QPixmap(self.me_avatar_path)
+            if not pix.isNull():
+                avatar_label.setPixmap(pix.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            v.addWidget(avatar_label, alignment=Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(name_edit, alignment=Qt.AlignmentFlag.AlignCenter)
+            # 聊天输入与发送按钮（占位，后续集成服务器）
+            self.me_chat_input = QLineEdit()
+            self.me_chat_input.setPlaceholderText("输入聊天内容")
+            self.me_chat_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.me_chat_input.setEnabled(False)  # 游戏开始后再启用
+            self.me_chat_send_btn = QPushButton("发送")
+            self.me_chat_send_btn.setEnabled(False)
+            # 移除占位点击连接，真实发送逻辑在 connect_signals 中绑定
+            btn_row = QHBoxLayout()
+            btn_row.addWidget(self.me_chat_input)
+            btn_row.addWidget(self.me_chat_send_btn)
+            v.addLayout(btn_row)
+        else:
+            name_label = QLabel("随机")
+            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_label.setStyleSheet("font-weight: 500;")
+            self.seat_name_labels[seat] = name_label
+            # 记录头像标签，便于后续更新
+            self.seat_avatar_labels[seat] = avatar_label
+            # AI下拉选择
+            combo = QComboBox()
+            combo.setMinimumWidth(140)
+            self.seat_combos[seat] = combo
+            v.addWidget(avatar_label, alignment=Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(name_label, alignment=Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(combo, alignment=Qt.AlignmentFlag.AlignCenter)
+            # 初始头像：随机状态不显示头像（空白）
+            avatar_label.clear()
+        
+        # 根据席位刷新下拉选项
+        self._refresh_persona_options()
+        return frame
+    
+    def _refresh_persona_options(self):
+        """根据当前分配状态刷新每个席位的下拉选项，确保唯一性。"""
+        used = {assign for seat, assign in self.seat_assignments.items() if assign != "random"}
+        for seat, combo in self.seat_combos.items():
+            current = self.seat_assignments.get(seat, "random")
+            # 为该席位可选集合：所有 - 其他已用
+            allowed = [k for k in self.personas.keys() if k not in (used - ({current} if current != "random" else set()))]
+            # 生成显示文本数组
+            items = ["随机"] + [self.personas[k]["name"] for k in allowed]
+            prev_text = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(items)
+            # 恢复原选择（若仍可用），否则保持随机
+            if current != "random":
+                name = self.personas[current]["name"]
+                idx = combo.findText(name)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                else:
+                    combo.setCurrentIndex(0)
+            else:
+                # 保持随机
+                combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+    
+    def _on_seat_selection_changed(self, seat: Player):
+        """当某席位选择变化时，更新分配并刷新其他席位可选项与名称显示与头像。"""
+        combo = self.seat_combos.get(seat)
+        if not combo:
+            return
+        text = combo.currentText()
+        avatar_label = self.seat_avatar_labels.get(seat)
+        name_label = self.seat_name_labels.get(seat)
+        if text == "随机":
+            self.seat_assignments[seat] = "random"
+            if name_label:
+                name_label.setText("随机")
+            if avatar_label:
+                avatar_label.clear()
+        else:
+            # 文本到key
+            key = self._persona_name_to_key.get(text)
+            if key:
+                self.seat_assignments[seat] = key
+                if name_label:
+                    name_label.setText(text)
+                # 更新头像
+                persona = self.personas.get(key)
+                avatar_path = persona.get("avatar")
+                if avatar_label:
+                    if avatar_path:
+                        pix = QPixmap(avatar_path)
+                        if not pix.isNull():
+                            avatar_label.setPixmap(pix.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                        else:
+                            avatar_label.clear()
+                    else:
+                        avatar_label.clear()
+        # 刷新其他席位的选项，保证唯一性
+        self._refresh_persona_options()
+    
+    def finalize_ai_assignments(self):
+        """开始游戏前，将随机席位从可用池中唯一分配，并更新名称显示。"""
+        chosen = {assign for assign in self.seat_assignments.values() if assign != "random"}
+        remaining = [k for k in self.personas.keys() if k not in chosen]
+        # 为每个随机席位分配未使用的人物
+        for seat, assign in list(self.seat_assignments.items()):
+            if assign == "random":
+                if not remaining:
+                    # 若资源不足，回收全部后再随机（理论上不会发生，因为总席位=3）
+                    remaining = list(self.personas.keys())
+                pick = random.choice(remaining)
+                remaining.remove(pick)
+                self.seat_assignments[seat] = pick
+                # 更新名称
+                name = self.personas[pick]["name"]
+                if self.seat_name_labels.get(seat):
+                    self.seat_name_labels[seat].setText(name)
+                # 更新头像
+                avatar_label = self.seat_avatar_labels.get(seat)
+                avatar_path = self.personas[pick].get("avatar")
+                if avatar_label:
+                    pix = QPixmap(avatar_path) if avatar_path else QPixmap()
+                    if not pix.isNull():
+                        avatar_label.setPixmap(pix.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                    else:
+                        avatar_label.clear()
+        # 刷新下拉选项，使其与最终分配一致
+        self._refresh_persona_options()
+
+    def _layout_play_area(self):
+        """在播放区域中居中棋盘，并按指定参考坐标放置头像框"""
+        if not hasattr(self, 'play_area') or self.play_area is None:
+            return
+        # 允许播放区域缩小
+        self.play_area.setMinimumSize(QSize(200, 200))
+        
+        # 根据可用空间计算缩放比例（不放大，只缩小）
+        area_w = self.play_area.width()
+        area_h = self.play_area.height()
+        base_total_w = self.board_widget.board.cols * (self.board_widget.base_cell_size + self.board_widget.base_cell_spacing) + 2 * self.board_widget.base_margin
+        base_total_h = self.board_widget.board.rows * (self.board_widget.base_cell_size + self.board_widget.base_cell_spacing) + 2 * self.board_widget.base_margin
+        if area_w > 0 and area_h > 0:
+            scale = min(1.0, area_w / base_total_w, area_h / base_total_h)
+            self.board_widget.set_scale_factor(scale)
+        
+        # 居中棋盘
+        bw = self.board_widget.total_width
+        bh = self.board_widget.total_height
+        self._board_offset_x = max((area_w - bw) // 2, 0)
+        self._board_offset_y = max((area_h - bh) // 2, 0)
+        self.board_widget.move(self._board_offset_x, self._board_offset_y)
+        self.board_widget.resize(bw, bh)
+        
+        # 重新定位头像框
+        self._position_avatar_frames()
+
+    def _cell_top_left_in_play_area(self, row: int, col: int) -> tuple[int, int]:
+        """根据棋盘全局(row,col)计算在播放区域中的格子左上角像素坐标"""
+        step = self.board_widget.cell_size + self.board_widget.cell_spacing
+        x = self._board_offset_x + self.board_widget.margin + col * step
+        y = self._board_offset_y + self.board_widget.margin + row * step
+        return x, y
+
+    def _compute_global_from_local(self, seat: Player, local_row: int, local_col: int) -> tuple[int, int]:
+        """依据各方局部坐标换算为棋盘全局(row,col)。局部坐标从1开始。"""
+        if seat == Player.PLAYER1:  # 南方：行11-16、列6-10
+            return (local_row + 10, local_col + 5)
+        elif seat == Player.PLAYER3:  # 北方：行0-5、列6-10（180度）
+            return (6 - local_row, 11 - local_col)
+        elif seat == Player.PLAYER4:  # 东方：行6-10、列11-16（顺时针90度）
+            return (11 - local_col, local_row + 10)
+        elif seat == Player.PLAYER2:  # 西方：行6-10、列0-5（逆时针90度）
+            return (local_col + 5, 6 - local_row)
+        else:
+            return (0, 0)
+
+    def _position_avatar_frames(self):
+        """将头像框放置到用户指定的空白区域：
+        - 南：南3,5以东
+        - 北：北3,5以西
+        - 东：东6,3以东
+        - 西：西6,3以西
+        """
+        if not hasattr(self, 'avatar_frames'):
+            return
+        gap = self.board_widget.cell_spacing + 16
+        cell_size = self.board_widget.cell_size
+        
+        def place(seat: Player, local_rc: tuple[int, int], side: str):
+            if seat not in self.avatar_frames:
+                return
+            row, col = self._compute_global_from_local(seat, local_rc[0], local_rc[1])
+            x, y = self._cell_top_left_in_play_area(row, col)
+            frame = self.avatar_frames[seat]
+            fw = frame.width()
+            fh = frame.height()
+            if side == 'east':
+                fx = x + cell_size + gap
+            else:  # 'west'
+                fx = x - gap - fw
+            fy = y + cell_size // 2 - fh // 2
+            frame.move(fx, fy)
+        
+        # 依据参考坐标放置四个头像框
+        place(Player.PLAYER1, (3, 5), 'east')  # 南方
+        place(Player.PLAYER3, (3, 5), 'west')  # 北方
+        place(Player.PLAYER4, (6, 3), 'east')  # 东方
+        place(Player.PLAYER2, (6, 3), 'west')  # 西方
+
+    def _on_send_chat_clicked(self):
+        """发送聊天：提交后锁定，等待广播解锁"""
+        if not self.ws_connected_flag:
+            QMessageBox.warning(self, "未连接", "尚未连接到服务器，稍后再试。")
+            return
+        if not self.me_chat_input:
+            return
+        text = (self.me_chat_input.text() or "").strip()
+        if not text:
+            self.status_bar.showMessage("请输入聊天内容再发送。")
+            return
+        # 锁定输入与按钮，待广播后解锁
+        self.chat_locked = True
+        self.me_chat_input.setEnabled(False)
+        if self.me_chat_send_btn:
+            self.me_chat_send_btn.setEnabled(False)
+        self.status_bar.showMessage("聊天已提交，等待广播...")
+        # 发送到服务器
+        payload = {
+            "type": "submit_chat",
+            "text": text,
+            "utterance_target": "all",
+        }
+        if self.ws_client:
+            self.ws_client.send(payload)
+
+    def _on_ws_connected(self):
+        """WS连接建立后，启用聊天控件，并在需要时同步人物分配与开始游戏"""
+        self.ws_connected_flag = True
+        if self.me_chat_input:
+            self.me_chat_input.setEnabled(True)
+        if self.me_chat_send_btn:
+            self.me_chat_send_btn.setEnabled(True)
+        self.status_bar.showMessage("已连接服务器，聊天可用。")
+        # 连接后优先发送人物分配（finalize_ai_assignments 已在 start_game 前完成）
+        try:
+            if self.ws_client:
+                assignments = {}
+                for seat, persona_key in self.seat_assignments.items():
+                    if isinstance(persona_key, str) and persona_key != "random":
+                        assignments[str(seat.value)] = persona_key
+                if assignments:
+                    self.ws_client.send({
+                        "type": "set_persona_assignments",
+                        "assignments": assignments,
+                    })
+        except Exception:
+            pass
+        # 如果当前已经进入对战阶段，通知服务器开始游戏（保证顺序在人物分配之后）
+        try:
+            if self.game_logic.game_state == GameState.PLAYING:
+                if self.ws_client:
+                    self.ws_client.send({"type": "start_game"})
+        except Exception:
+            pass
+
+    def _on_chat_received_ack(self, data: dict):
+        """服务器确认已收到聊天（不解锁，等待广播）"""
+        self.status_bar.showMessage("服务器已收到聊天，稍后将广播。")
+
+    def _on_chat_message_broadcast(self, data: dict):
+        """服务器广播聊天后，解锁输入并清空"""
+        self.chat_locked = False
+        if self.me_chat_input:
+            self.me_chat_input.clear()
+            self.me_chat_input.setEnabled(True)
+        if self.me_chat_send_btn:
+            self.me_chat_send_btn.setEnabled(True)
+        # 状态栏显示收到的聊天内容
+        t = data.get("text")
+        p = data.get("player_id")
+        self.status_bar.showMessage(f"聊天广播：玩家{p}：{t}")
+
+# === 全局控制模块（开发模式按钮显示/隐藏，统一放置文件末尾）===
+# 将下方变量设为 False 可隐藏主界面上的“开发模式”按钮；设为 True 则显示。
+DEV_MODE_BUTTON_VISIBLE = False

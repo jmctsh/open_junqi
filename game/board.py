@@ -1009,3 +1009,27 @@ class Board:
                 if self.can_move(from_pos, to_pos):
                     return True
         return False
+
+    def enumerate_player_legal_moves(self, player: Player) -> List[Tuple[Position, Position]]:
+        """枚举指定玩家的所有合法走法，返回 (from_pos, to_pos) 列表"""
+        legal_moves: List[Tuple[Position, Position]] = []
+        for cell in self.cells.values():
+            if not cell.piece or cell.piece.player != player:
+                continue
+            # 起点不可为总部，且不可为地雷/军旗
+            if cell.cell_type == CellType.HEADQUARTERS or cell.piece.is_mine() or cell.piece.is_flag():
+                continue
+            from_pos = cell.position
+            # 候选目的地集合
+            if cell.cell_type == CellType.RAILWAY:
+                if cell.piece.is_engineer():
+                    candidates = self.get_railway_connected_positions(from_pos)
+                else:
+                    candidates = self.get_railway_straight_reachable_positions(from_pos)
+            else:
+                candidates = set(self.get_adjacent_positions(from_pos))
+            # 过滤为真实合法走法
+            for to_pos in candidates:
+                if self.can_move(from_pos, to_pos):
+                    legal_moves.append((from_pos, to_pos))
+        return legal_moves

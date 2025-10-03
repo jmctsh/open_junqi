@@ -11,6 +11,7 @@ from .board import Board, Position, CellType
 from .piece import PieceType, Piece, create_player_pieces
 from .formations import list_formations as fm_list, has_formation as fm_has, FORMATIONS, char_to_piece_type
 from .piece import Piece, Player, PieceType, create_player_pieces
+from .history import HistoryRecorder, MoveRecord
 
 class GameState(Enum):
     """游戏状态"""
@@ -31,6 +32,8 @@ class GameLogic:
         self.eliminated_players: Set[Player] = set()
         # 测试模式：显示所有棋子并允许操作所有玩家（默认关闭）
         self.testing_mode: bool = False
+        # 棋局历史记录器
+        self.history = HistoryRecorder()
         
         # 初始化玩家棋子
         for player in Player:
@@ -191,52 +194,64 @@ class GameLogic:
         self.testing_mode = False
         # 清空淘汰列表
         self.eliminated_players.clear()
+        # 清空历史（新对局从回合1开始）
+        self.history.clear()
+        # 为当前棋盘上的所有棋子分配唯一ID（按阵营本地坐标顺序，编号从001开始）
+        self._assign_piece_ids()
         return True
     
-    def move_piece(self, from_pos: Position, to_pos: Position) -> bool:
-        """移动棋子"""
-        if self.game_state != GameState.PLAYING:
-            return False
-        
-        from_cell = self.board.get_cell(from_pos)
-        if not from_cell or not from_cell.piece:
-            return False
-        
-        # 检查是否是当前玩家的棋子
-        if (not self.testing_mode) and (from_cell.piece.player != self.current_player):
-            return False
-        
-        # 记录防守方是否为军旗，以便战斗后判定强制淘汰
-        pre_to_cell = self.board.get_cell(to_pos)
-        defender_flag_owner = None
-        if pre_to_cell and pre_to_cell.piece and pre_to_cell.piece.is_flag():
-            defender_flag_owner = pre_to_cell.piece.player
+    def reset_game(self):
+        """重置游戏"""
+        # 恢复到初始化时的状态：新棋盘、布局阶段、当前玩家重置
+        self.board = Board()
+        self.game_state = GameState.SETUP
+        self.current_player = Player.PLAYER1
+        self.eliminated_players.clear()
+        # 清空历史
+        self.history.clear()
+        # 重新初始化玩家棋子与标记布局未完成
+        for player in Player:
+            self.player_pieces[player] = create_player_pieces(player)
+            self.setup_complete[player] = False
+        # 与构造函数保持一致：为四方随机选择名阵并自动布局
+        # 这样重置后立即进入可调整的布局阶段，等待用户点击开始游戏
+        self.auto_layout_all_players()
+    
+    def get_game_state(self) -> Dict:
+        """获取游戏状态信息"""
+        return {
+            'state': self.game_state,
+            'current_player': self.current_player,
+            'setup_complete': self.setup_complete.copy()
+        }
 
-        # 尝试移动
-        if self.board.move_piece(from_pos, to_pos):
-            # 若本次战斗吃掉了军旗，则强制淘汰该玩家并清除其所有棋子
-            if defender_flag_owner is not None:
-                # 判定目标格是否仍为军旗，若不是则视为军旗被吃
-                post_to_cell = self.board.get_cell(to_pos)
-                if (not post_to_cell) or (not post_to_cell.piece) or (not post_to_cell.piece.is_flag()):
-                    # 强制淘汰：加入淘汰列表并清除该玩家所有棋子
-                    self.eliminated_players.add(defender_flag_owner)
+    # === 辅助：同步淘汰状态 ===
+    def _ensure_elimination_status(self) -> None:
+        """检查各玩家是否已无子或已无任何可移动的子，若满足其一则加入淘汰列表（立即生效）"""
+        remaining: Dict[Player, int] = {p: 0 for p in Player}
+        for cell in self.board.cells.values():
+            if cell.piece:
+                remaining[cell.piece.player] += 1
+        for p, count in remaining.items():
+            if count == 0:
+                # 无子：标记淘汰并清空棋子（幂等，实际无子不产生变化）
+                if p not in self.eliminated_players:
+                    self.eliminated_players.add(p)
                     for position, cell in self.board.cells.items():
-                        if cell.piece and cell.piece.player == defender_flag_owner:
+                        if cell.piece and cell.piece.player == p:
                             cell.piece = None
-
-            # 更新淘汰状态：无子或无任何合法走法者立即淘汰
-            self._ensure_elimination_status()
-            # 轴队判负：南北同亡或东西同亡即结束
-            south_north_eliminated = (Player.PLAYER1 in self.eliminated_players) and (Player.PLAYER3 in self.eliminated_players)
-            east_west_eliminated = (Player.PLAYER2 in self.eliminated_players) and (Player.PLAYER4 in self.eliminated_players)
-            if self.board.is_game_over() or south_north_eliminated or east_west_eliminated:
-                self.game_state = GameState.FINISHED
             else:
-                self._next_turn()
-            return True
-        return False
+                # 有子但可能均不可移动：检查是否存在至少一个合法走法
+                if not self.board.has_player_any_legal_move(p):
+                    if p not in self.eliminated_players:
+                        self.eliminated_players.add(p)
+                        # 与军旗被吃一致：立即清除该玩家所有棋子
+                        for position, cell in self.board.cells.items():
+                            if cell.piece and cell.piece.player == p:
+                                cell.piece = None
 
+    # 重复的 _assign_piece_ids 方法已移除，保留下方唯一实现以避免歧义。
+    
     # === 布局阶段：拖拽交换 ===
     def can_piece_stand_at(self, piece: Piece, position: Position) -> bool:
         """检查棋子在目标位置是否满足布局规则（不考虑占用）"""
@@ -358,52 +373,106 @@ class GameLogic:
         self._next_turn()
         return True
     
-    def reset_game(self):
-        """重置游戏"""
-        # 恢复到初始化时的状态：新棋盘、布局阶段、当前玩家重置
-        self.board = Board()
-        self.game_state = GameState.SETUP
-        self.current_player = Player.PLAYER1
-        self.eliminated_players.clear()
-
-        # 重新初始化玩家棋子与标记布局未完成
-        for player in Player:
-            self.player_pieces[player] = create_player_pieces(player)
-            self.setup_complete[player] = False
-
-        # 与构造函数保持一致：为四方随机选择名阵并自动布局
-        # 这样重置后立即进入可调整的布局阶段，等待用户点击开始游戏
-        self.auto_layout_all_players()
-    
-    def get_game_state(self) -> Dict:
-        """获取游戏状态信息"""
-        return {
-            'state': self.game_state,
-            'current_player': self.current_player,
-            'setup_complete': self.setup_complete.copy()
-        }
-
-    # === 辅助：同步淘汰状态 ===
-    def _ensure_elimination_status(self) -> None:
-        """检查各玩家是否已无子或已无任何可移动的子，若满足其一则加入淘汰列表（立即生效）"""
-        remaining: Dict[Player, int] = {p: 0 for p in Player}
-        for cell in self.board.cells.values():
-            if cell.piece:
-                remaining[cell.piece.player] += 1
-        for p, count in remaining.items():
-            if count == 0:
-                # 无子：标记淘汰并清空棋子（幂等，实际无子不产生变化）
-                if p not in self.eliminated_players:
-                    self.eliminated_players.add(p)
+    def move_piece(self, from_pos: Position, to_pos: Position) -> bool:
+        """移动棋子"""
+        if self.game_state != GameState.PLAYING:
+            return False
+        from_cell = self.board.get_cell(from_pos)
+        if not from_cell or not from_cell.piece:
+            return False
+        # 检查是否是当前玩家的棋子
+        if (not self.testing_mode) and (from_cell.piece.player != self.current_player):
+            return False
+        # 记录防守方是否为军旗，以便战斗后判定强制淘汰
+        pre_to_cell = self.board.get_cell(to_pos)
+        defender_flag_owner = None
+        defender_piece_id = None
+        if pre_to_cell and pre_to_cell.piece:
+            if pre_to_cell.piece.is_flag():
+                defender_flag_owner = pre_to_cell.piece.player
+            defender_piece_id = pre_to_cell.piece.piece_id
+        # 保存移动方信息与移动前后本地坐标，供历史记录
+        attacker_player = from_cell.piece.player
+        attacker_piece_id = from_cell.piece.piece_id
+        lr_from, lc_from = self._get_local_coords(from_pos, attacker_player)
+        lr_to, lc_to = self._get_local_coords(to_pos, attacker_player)
+        # 尝试移动
+        if self.board.move_piece(from_pos, to_pos):
+            outcome = "move"
+            dead_ids: List[str] = []
+            # 战斗后状态判断
+            post_to_cell = self.board.get_cell(to_pos)
+            # 移动成功但目标位置原本有子 -> 必然发生过战斗
+            if defender_piece_id is not None:
+                # 判断战斗结果
+                if post_to_cell and post_to_cell.piece and post_to_cell.piece.piece_id == attacker_piece_id:
+                    # 攻击方获胜，占据目标格
+                    outcome = "attack_attacker_wins"
+                    # 防守方死亡
+                    if defender_piece_id:
+                        dead_ids.append(defender_piece_id)
+                elif post_to_cell and post_to_cell.piece and post_to_cell.piece.piece_id == defender_piece_id:
+                    # 防守方获胜，攻击方死亡
+                    outcome = "attack_defender_wins"
+                    if attacker_piece_id:
+                        dead_ids.append(attacker_piece_id)
+                else:
+                    # 双方都不在目标格：同归于尽
+                    outcome = "attack_both_die"
+                    if attacker_piece_id:
+                        dead_ids.append(attacker_piece_id)
+                    if defender_piece_id:
+                        dead_ids.append(defender_piece_id)
+            # 若本次战斗吃掉了军旗，则强制淘汰该玩家并清除其所有棋子
+            if defender_flag_owner is not None:
+                post_to_cell_flag = self.board.get_cell(to_pos)
+                if (not post_to_cell_flag) or (not post_to_cell_flag.piece) or (not post_to_cell_flag.piece.is_flag()):
+                    self.eliminated_players.add(defender_flag_owner)
                     for position, cell in self.board.cells.items():
-                        if cell.piece and cell.piece.player == p:
+                        if cell.piece and cell.piece.player == defender_flag_owner:
                             cell.piece = None
+            # 更新淘汰状态与回合
+            self._ensure_elimination_status()
+            south_north_eliminated = (Player.PLAYER1 in self.eliminated_players) and (Player.PLAYER3 in self.eliminated_players)
+            east_west_eliminated = (Player.PLAYER2 in self.eliminated_players) and (Player.PLAYER4 in self.eliminated_players)
+            if self.board.is_game_over() or south_north_eliminated or east_west_eliminated:
+                self.game_state = GameState.FINISHED
             else:
-                # 有子但可能均不可移动：检查是否存在至少一个合法走法
-                if not self.board.has_player_any_legal_move(p):
-                    if p not in self.eliminated_players:
-                        self.eliminated_players.add(p)
-                        # 与军旗被吃一致：立即清除该玩家所有棋子
-                        for position, cell in self.board.cells.items():
-                            if cell.piece and cell.piece.player == p:
-                                cell.piece = None
+                self._next_turn()
+            # 记录历史：轮次=刚刚移动的玩家轮次（在切换前），玩家阵营用方位字符串
+            faction_map = {Player.PLAYER1: "south", Player.PLAYER2: "west", Player.PLAYER3: "north", Player.PLAYER4: "east"}
+            record = MoveRecord(
+                turn=len(self.history.records) + 1,
+                player_faction=faction_map[attacker_player],
+                piece_id=attacker_piece_id or "",
+                from_local=(lr_from, lc_from),
+                to_local=(lr_to, lc_to),
+                outcome=outcome,
+                defender_piece_id=defender_piece_id,
+                dead_piece_ids=dead_ids or []
+            )
+            self.history.add_record(record)
+            return True
+        return False
+
+    def _assign_piece_ids(self) -> None:
+        """在游戏开始时为所有棋子分配唯一ID，格式：<faction>_<NNN>，如 south_001"""
+        prefix_map = {
+            Player.PLAYER1: "south",
+            Player.PLAYER2: "west",
+            Player.PLAYER3: "north",
+            Player.PLAYER4: "east",
+        }
+        # 每个阵营的计数器
+        counters = {p: 0 for p in Player}
+        for p in Player:
+            # 使用阵营本地坐标排序，确保编号稳定易于理解（先行后列）
+            area_positions = sorted(
+                self.get_player_setup_area(p),
+                key=lambda pos: self._get_local_coords(pos, p)
+            )
+            for pos in area_positions:
+                cell = self.board.get_cell(pos)
+                if cell and cell.piece and cell.piece.player == p:
+                    counters[p] += 1
+                    cell.piece.piece_id = f"{prefix_map[p]}_{counters[p]:03d}"
