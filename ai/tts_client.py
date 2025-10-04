@@ -10,7 +10,7 @@ Doubao/OpenSpeech 语音合成(TTS) HTTP客户端封装。
 - DOUBAO_TTS_CLUSTER
 - DOUBAO_TTS_VOICE_TYPE
 
-注意：为保持与官方示例一致，HTTP请求体中的 app.token 字段保留为字符串 "access_token"，鉴权主要依赖 HTTP Header 的 Authorization。
+注意：为保持与官方示例一致，HTTP请求体中的 app.token 字段保留为实际的 access_token 值，鉴权依赖 HTTP Header 的 Authorization（Bearer;token）。
 """
 import os
 import base64
@@ -74,7 +74,8 @@ class DoubaoTTSClient:
         return {
             "app": {
                 "appid": self.appid,
-                "token": "access_token",  # 保持与官方示例一致
+                # 与官方示例保持一致：将 access_token 放入 JSON 体，Header 使用 Bearer;token
+                "token": self.access_token,
                 "cluster": self.cluster,
             },
             "user": {
@@ -102,7 +103,11 @@ class DoubaoTTSClient:
         将文本合成为音频字节（默认mp3）。
         返回音频二进制数据；异常时抛出 RuntimeError/ValueError。
         """
-        headers = {"Authorization": f"Bearer;{self.access_token}"}
+        headers = {
+            # 官方文档要求在 Authorization 中使用分号分隔：Bearer; {token}
+            "Authorization": f"Bearer;{self.access_token}",
+            "Content-Type": "application/json",
+        }
         payload = self._build_payload(text, **kwargs)
         # 与官方示例保持一致：使用 json.dumps 作为请求体
         resp = requests.post(self.api_url, data=json.dumps(payload), headers=headers, timeout=self.timeout)

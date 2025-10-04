@@ -34,6 +34,11 @@ class GameLogic:
         self.testing_mode: bool = False
         # 棋局历史记录器
         self.history = HistoryRecorder()
+        # 信号回调（由上层注册，用于进程管理）
+        self.on_game_started = None
+        self.on_turn_changed = None
+        self.on_player_eliminated = None
+        self.on_game_finished = None
         
         # 初始化玩家棋子
         for player in Player:
@@ -183,6 +188,13 @@ class GameLogic:
                 cell.piece = None
         self.setup_complete[player] = False
     
+    def set_signal_handlers(self, on_game_started=None, on_turn_changed=None, on_player_eliminated=None, on_game_finished=None):
+        """注册四个进程信号的回调函数。所有回调为同步函数；游戏层在关键节点触发它们。"""
+        self.on_game_started = on_game_started
+        self.on_turn_changed = on_turn_changed
+        self.on_player_eliminated = on_player_eliminated
+        self.on_game_finished = on_game_finished
+    
     def start_game(self) -> bool:
         """开始游戏"""
         # 检查所有玩家是否都完成了布局
@@ -198,6 +210,17 @@ class GameLogic:
         self.history.clear()
         # 为当前棋盘上的所有棋子分配唯一ID（按阵营本地坐标顺序，编号从001开始）
         self._assign_piece_ids()
+        # 触发信号：游戏开始与首手回合产生（视为一次回合变化）
+        if callable(self.on_game_started):
+            try:
+                self.on_game_started(self.current_player)
+            except Exception:
+                pass
+        if callable(self.on_turn_changed):
+            try:
+                self.on_turn_changed(self.current_player)
+            except Exception:
+                pass
         return True
     
     def reset_game(self):
@@ -240,6 +263,12 @@ class GameLogic:
                     for position, cell in self.board.cells.items():
                         if cell.piece and cell.piece.player == p:
                             cell.piece = None
+                    # 触发信号：玩家淘汰
+                    if callable(self.on_player_eliminated):
+                        try:
+                            self.on_player_eliminated(p)
+                        except Exception:
+                            pass
             else:
                 # 有子但可能均不可移动：检查是否存在至少一个合法走法
                 if not self.board.has_player_any_legal_move(p):
@@ -249,6 +278,12 @@ class GameLogic:
                         for position, cell in self.board.cells.items():
                             if cell.piece and cell.piece.player == p:
                                 cell.piece = None
+                        # 触发信号：玩家淘汰
+                        if callable(self.on_player_eliminated):
+                            try:
+                                self.on_player_eliminated(p)
+                            except Exception:
+                                pass
 
     # 重复的 _assign_piece_ids 方法已移除，保留下方唯一实现以避免歧义。
     
@@ -332,6 +367,11 @@ class GameLogic:
         # 若仅剩一位未淘汰玩家，则游戏结束
         if len(self.eliminated_players) >= len(ccw_order) - 1:
             self.game_state = GameState.FINISHED
+            if callable(self.on_game_finished):
+                try:
+                    self.on_game_finished()
+                except Exception:
+                    pass
             return
 
         # 尝试找到下一个未淘汰的玩家
@@ -339,10 +379,21 @@ class GameLogic:
             candidate = ccw_order[(current_index + step) % len(ccw_order)]
             if candidate not in self.eliminated_players:
                 self.current_player = candidate
+                # 触发信号：回合变更
+                if callable(self.on_turn_changed):
+                    try:
+                        self.on_turn_changed(self.current_player)
+                    except Exception:
+                        pass
                 return
         # 理论上不会到达这里；保险处理为游戏结束
         self.game_state = GameState.FINISHED
-
+        if callable(self.on_game_finished):
+            try:
+                self.on_game_finished()
+            except Exception:
+                pass
+    
     def skip_turn(self) -> bool:
         """跳过当前回合，切换到下一位玩家"""
         if self.game_state != GameState.PLAYING:
@@ -361,6 +412,12 @@ class GameLogic:
                 cell.piece = None
         # 标记淘汰
         self.eliminated_players.add(loser)
+        # 触发信号：玩家淘汰
+        if callable(self.on_player_eliminated):
+            try:
+                self.on_player_eliminated(loser)
+            except Exception:
+                pass
         # 立即同步淘汰状态：无子或无任何合法走法者加入淘汰
         self._ensure_elimination_status()
         # 队伍判负：南+北 或 东+西 同亡
@@ -368,6 +425,12 @@ class GameLogic:
         east_west_eliminated = (Player.PLAYER2 in self.eliminated_players) and (Player.PLAYER4 in self.eliminated_players)
         if self.board.is_game_over() or south_north_eliminated or east_west_eliminated:
             self.game_state = GameState.FINISHED
+            # 触发信号：游戏结束
+            if callable(self.on_game_finished):
+                try:
+                    self.on_game_finished()
+                except Exception:
+                    pass
             return True
         # 未结束则切换到下一位未淘汰玩家
         self._next_turn()
@@ -431,12 +494,24 @@ class GameLogic:
                     for position, cell in self.board.cells.items():
                         if cell.piece and cell.piece.player == defender_flag_owner:
                             cell.piece = None
+                    # 触发信号：玩家淘汰
+                    if callable(self.on_player_eliminated):
+                        try:
+                            self.on_player_eliminated(defender_flag_owner)
+                        except Exception:
+                            pass
             # 更新淘汰状态与回合
             self._ensure_elimination_status()
             south_north_eliminated = (Player.PLAYER1 in self.eliminated_players) and (Player.PLAYER3 in self.eliminated_players)
             east_west_eliminated = (Player.PLAYER2 in self.eliminated_players) and (Player.PLAYER4 in self.eliminated_players)
             if self.board.is_game_over() or south_north_eliminated or east_west_eliminated:
                 self.game_state = GameState.FINISHED
+                # 触发信号：游戏结束
+                if callable(self.on_game_finished):
+                    try:
+                        self.on_game_finished()
+                    except Exception:
+                        pass
             else:
                 self._next_turn()
             # 记录历史：轮次=刚刚移动的玩家轮次（在切换前），玩家阵营用方位字符串

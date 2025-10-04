@@ -1,4 +1,5 @@
 from typing import Dict
+import random
 
 """
 发言主题权重配置模块：将不同玩家的主题偏好从 agent 中剥离，便于单独修改。
@@ -90,3 +91,69 @@ def render_theme_prompt(weights: Dict[str, int]) -> str:
         f"- {weights['analysis']}% 分析其他玩家走棋动机与猜子（只做概率型推测，不得下‘绝对结论’）。\n",
     ]
     return "".join(lines)
+
+
+# 新增：主题中文标签与指导文案
+THEME_LABELS: Dict[str, str] = {
+    "explain_truth": "说真话解释",
+    "deception": "欺骗迷惑",
+    "taunt_enemy": "嘲讽敌人",
+    "taunt_teammate": "吐槽队友",
+    "memes": "玩梗吐槽",
+    "analysis": "分析推测",
+}
+
+THEME_GUIDANCE: Dict[str, str] = {
+    "explain_truth": (
+        "主题指导：\n"
+        "- 简要说明当前走法与意图，避免夸张和虚构；\n"
+        "- 不泄露未公开身份，只基于已知局面给出理性解释。\n"
+    ),
+    "deception": (
+        "主题指导：\n"
+        "- 通过夸大、模糊或选择性陈述来误导他人，不得捏造未公开身份；\n"
+        "- 可制造偏见或转移注意力，语气可以自信但不必给证据。\n"
+    ),
+    "taunt_enemy": (
+        "主题指导：\n"
+        "- 针对对手近期走子或局面错误进行嘲讽与挑衅；\n"
+        "- 点名并评价其‘蠢/贪/怂’等，但保持与局面相关。\n"
+    ),
+    "taunt_teammate": (
+        "主题指导：\n"
+        "- 围绕配合与局面失误对队友吐槽，避免人身辱骂；\n"
+        "- 指出具体失误或错失机会，语气消极但要有事实依据。\n"
+    ),
+    "memes": (
+        "主题指导：\n"
+        "- 结合棋局常见梗（铁路快攻、九宫格、踩雷、行营卡位等）进行玩梗吐槽；\n"
+        "- 避免单一梗复读，尝试混合多个梗。\n"
+    ),
+    "analysis": (
+        "主题指导：\n"
+        "- 对他人走棋动机与棋子身份进行概率性推测，不下绝对结论；\n"
+        "- 结合历史与可见信息说明威胁与机会。\n"
+    ),
+}
+
+
+def sample_theme(weights: Dict[str, int]) -> str:
+    """按权重在本地抽样一个主题。权重不合法时回退到默认。"""
+    if not isinstance(weights, dict):
+        weights = DEFAULT_THEME_WEIGHTS.copy()
+    keys = list(DEFAULT_THEME_WEIGHTS.keys())
+    w_list = [max(0, int(weights.get(k, 0))) for k in keys]
+    total = sum(w_list)
+    if total <= 0:
+        w_list = [DEFAULT_THEME_WEIGHTS[k] for k in keys]
+    return random.choices(keys, weights=w_list, k=1)[0]
+
+
+def get_theme_label(theme_key: str) -> str:
+    """返回主题的中文标签。"""
+    return THEME_LABELS.get(theme_key, theme_key)
+
+
+def render_selected_theme_prompt(theme_key: str) -> str:
+    """渲染已抽样主题的指导文案，供系统提示直接注入。"""
+    return THEME_GUIDANCE.get(theme_key, "")

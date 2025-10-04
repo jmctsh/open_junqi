@@ -41,17 +41,17 @@ def _positional_gain(board: Board, attacker: Piece, to_pos: Position) -> float:
     if not cell:
         return gain
     if _is_center(to_pos):
-        gain += 1.0
+        gain += 0.8  # 降低中心加成，避免过度偏好
     if cell.cell_type == CellType.RAILWAY:
         # 铁路枢纽连通度加分
         adj = [p for p in board.get_adjacent_positions(to_pos) if board.get_cell(p) and board.get_cell(p).cell_type == CellType.RAILWAY]
         gain += min(len(adj), 4) * 0.15
     # 敌方区域推进（进入非本方区域且非行营）
     if cell.player_area and cell.player_area != attacker.player:
-        gain += 0.3
+        gain += 0.4  # 适度提高推进奖励，鼓励进攻与压制
     # 行营驻守的稳健收益
     if cell.cell_type == CellType.CAMP:
-        gain += 0.25
+        gain += 0.35  # 强化行营驻守
     return gain
 
 
@@ -163,12 +163,13 @@ def _attack_ev(board: Board, attacker: Piece, to_pos: Position) -> float:
         else:
             return -0.15  # 送子
     else:
-        # 未知：保守估计（存在能击败我方的可能）
-        # 简化为轻微负向，除非攻击方为高阶子且位置极优
+        # 未知：保守估计（存在能击败我方的可能），但不过度惩罚，鼓励强子试探
         ap = _piece_value(attacker)
-        base = -0.08
+        base = -0.02
         if ap >= 7:  # 旅长及以上更有胜算
-            base += 0.05
+            base += 0.08
+        if ap >= 9:  # 师长及以上进一步放宽
+            base += 0.04
         return base
 
 
@@ -225,7 +226,7 @@ def _tactics(board: Board, attacker: Piece, from_pos: Position, to_pos: Position
 def score_legal_moves(board: Board, player: Player, legal_moves: List[Tuple[Position, Position]], top_n: int = 30) -> List[Dict[str, Any]]:
     """对合法走法进行轻量评分与标签生成，并挑选约 top_n 条结果。
     仅依赖公开信息：若防守方不可见，则不使用其真实类型。
-    返回结构适合直接发送给 LLM：包含 id/from/to/piece_id/score/risk_level/reward_level/tactics/reason。
+    返回结构适合直接发送给 LLM：包含 id/from/to/piece_id/risk_level/tactics/reason。
     """
     scored: List[ScoredMove] = []
     for idx, (from_pos, to_pos) in enumerate(legal_moves):
@@ -240,12 +241,12 @@ def score_legal_moves(board: Board, player: Player, legal_moves: List[Tuple[Posi
         mob = _mobility_potential(board, attacker, to_pos)
         info = _info_gain(board, to_pos)
         defense = _defense_value(board, player, to_pos)
-        # 权重组合
-        w_attack, w_pos, w_risk, w_mob, w_info, w_def = 1.0, 0.35, 0.45, 0.25, 0.1, 0.5
+        # 权重组合（调整以鼓励进攻、防守与均衡）
+        w_attack, w_pos, w_risk, w_mob, w_info, w_def = 1.2, 0.25, 0.3, 0.2, 0.15, 0.6
         # 在旗处高威胁时提升防守权重（简单判定：旗邻有敌子）
         flag_near_enemy = defense > 0.0
         if flag_near_enemy:
-            w_def = 0.8
+            w_def = 0.9
         score = (w_attack * attack_ev +
                  w_pos * pos_gain -
                  w_risk * risk +
@@ -261,19 +262,11 @@ def score_legal_moves(board: Board, player: Player, legal_moves: List[Tuple[Posi
             piece_id=attacker.piece_id,
             score=float(round(score, 3)),
             risk_level=_label_risk(risk),
-            reward_level="low",  # 占位，稍后基于分布更新
+            reward_level="low",  # 占位，不对外暴露
             tactics=tactics,
             reason=reason,
         ))
-    # 计算 reward_level
-    if scored:
-        import statistics
-        scores = [m.score for m in scored]
-        mean = statistics.mean(scores)
-        std = statistics.pstdev(scores) if len(scores) > 1 else 0.0
-        for m in scored:
-            m.reward_level = _label_reward(m.score, mean, std)
-    # 排序
+    # 保留内部排序与多样性选择逻辑，但不向外暴露分数
     scored.sort(key=lambda m: m.score, reverse=True)
     # 多样性选择（简单版）：优先各战术类型的前若干条，再补齐
     selection: List[ScoredMove] = []
@@ -284,7 +277,7 @@ def score_legal_moves(board: Board, player: Player, legal_moves: List[Tuple[Posi
         "rail_sprint": 6,
         "central_control": 4,
         "defend_flag": 6,
-        "camp_hold": 2,
+        "camp_hold": 3,  # 略微提升行营驻守占比
         "scout": 2,
         "reposition": 2,
     }
@@ -311,7 +304,7 @@ def score_legal_moves(board: Board, player: Player, legal_moves: List[Tuple[Posi
             used.add(m.idx)
             if len(selection) >= top_n:
                 break
-    # 输出为字典列表
+    # 输出为字典列表（不包含 score 与 reward_level）
     result: List[Dict[str, Any]] = []
     for i, m in enumerate(selection):
         result.append({
@@ -319,9 +312,7 @@ def score_legal_moves(board: Board, player: Player, legal_moves: List[Tuple[Posi
             "from": {"row": m.from_pos.row, "col": m.from_pos.col},
             "to": {"row": m.to_pos.row, "col": m.to_pos.col},
             "piece_id": m.piece_id,
-            "score": m.score,
             "risk_level": m.risk_level,
-            "reward_level": m.reward_level,
             "tactics": m.tactics,
             "reason": m.reason,
         })
@@ -330,8 +321,7 @@ def score_legal_moves(board: Board, player: Player, legal_moves: List[Tuple[Posi
 
 def _build_reason(score: float, risk: float, attack_ev: float, tactics: List[str]) -> str:
     parts: List[str] = []
-    parts.append(f"score={round(score, 2)}")
-    parts.append(f"risk={_label_risk(risk)}")
+    parts.append(f"风险={_label_risk(risk)}")
     if attack_ev > 0.15:
         parts.append("吃子存活")
     elif -0.1 <= attack_ev <= 0.15:

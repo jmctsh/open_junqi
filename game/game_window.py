@@ -5,15 +5,16 @@
 
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QStatusBar, QMessageBox, QMenu, QComboBox, QLineEdit, QSizePolicy)
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QSize, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QSize, QPoint, QUrl, QTimer
 from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QMouseEvent, QCursor, QPixmap, QPolygon
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from .game_logic import GameLogic, GameState
 from .board import Position, CellType
 from .piece import Player
+from .history import ChatRecord
 import os
 import random
-
-from .ws_client import WSClient
+import winsound
 
 class BoardWidget(QWidget):
     """棋盘渲染组件"""
@@ -568,6 +569,8 @@ class GameWindow(QMainWindow):
     ws_error = pyqtSignal(str)
     chat_message_received = pyqtSignal(dict)
     chat_received_ack = pyqtSignal(dict)
+    # 新增：玩家聊天气泡信号（data包含{text, seat}）
+    player_chat_bubble = pyqtSignal(dict)
     
     def __init__(self):
         super().__init__()
@@ -598,10 +601,22 @@ class GameWindow(QMainWindow):
         self.me_chat_input = None
         self.me_chat_send_btn = None
         self.chat_locked = False
+
+        # 语音播放组件
+        self._audio_player = QMediaPlayer(self)
+        self._audio_output = QAudioOutput(self)
+        self._audio_player.setAudioOutput(self._audio_output)
+        try:
+            self._audio_output.setMuted(False)
+            self._audio_output.setVolume(1.0)
+        except Exception:
+            pass
         
         # 头像定位参数
         self.avatar_frames = {}
         self.avatar_padding = 48
+        # 每个席位当前显示的聊天气泡（用于避免叠加与清理）
+        self._seat_bubbles = {}
         self.setup_ui()
         self.connect_signals()
         # 启动时自动布局四方后刷新显示
@@ -709,11 +724,29 @@ class GameWindow(QMainWindow):
         # 聊天发送按钮
         if self.me_chat_send_btn:
             self.me_chat_send_btn.clicked.connect(self._on_send_chat_clicked)
+
+    # 顶层统一实例接线入口
+    def set_managers(self, server, process):
+        """由顶层在初始化时注入 GameServer 与 GameProcess，并完成与规则层的接线。"""
+        self.server = server
+        self.process = process
+        try:
+            # 先注册进程层，确保信号同步到进程层
+            self.server.set_game_process(self.process)
+        except Exception:
+            pass
+        try:
+            # 再将统一的规则层传入服务器（进程层也已在上一步绑定）
+            self.server.set_game_logic(self.game_logic)
+        except Exception:
+            pass
         # WebSocket 事件信号
         self.ws_connected.connect(self._on_ws_connected)
         self.ws_error.connect(lambda msg: self.status_bar.showMessage(f"WS错误：{msg}"))
         self.chat_received_ack.connect(self._on_chat_received_ack)
         self.chat_message_received.connect(self._on_chat_message_broadcast)
+        # 玩家聊天气泡
+        self.player_chat_bubble.connect(self._show_player_chat_bubble)
 
     def on_cell_clicked(self, row: int, col: int, button: int):
         """处理格子点击事件"""
@@ -745,8 +778,30 @@ class GameWindow(QMainWindow):
                         self.board_widget.clear_selection()
                         QMessageBox.warning(self, "非法调整", "该位置不符合布局规则，已恢复。")
         elif self.game_logic.game_state == GameState.PLAYING:
-            # 游戏阶段 - 处理移动
-            self.handle_piece_move(position)
+            # 游戏阶段 - 处理移动（内联处理，避免缺失方法导致崩溃）
+            if (not self.game_logic.testing_mode) and (self.game_logic.current_player != Player.PLAYER1):
+                self.status_bar.showMessage("当前不是你的回合")
+                self.board_widget.clear_selection()
+                return
+            if self.board_widget.selected_position is None:
+                self.select_piece(position)
+                return
+            from_pos = self.board_widget.selected_position
+            if position.row == from_pos.row and position.col == from_pos.col:
+                self.board_widget.clear_selection()
+                self.board_widget.update()
+                return
+            in_valid = any((position.row == mv.row and position.col == mv.col) for mv in self.board_widget.valid_moves)
+            if in_valid:
+                ok = self.game_logic.move_piece(from_pos, position)
+                if ok:
+                    self.board_widget.clear_selection()
+                    self.update_display()
+                else:
+                    self.status_bar.showMessage("非法移动：不符合规则或未轮到你")
+                    self.board_widget.clear_selection()
+                return
+            self.select_piece(position)
 
     def on_cell_dragged(self, fr: int, fc: int, tr: int, tc: int):
         """拖拽交换（布局阶段）"""
@@ -837,7 +892,7 @@ class GameWindow(QMainWindow):
         """显示标记菜单"""
         menu = QMenu(self)
         
-        marks = ["司", "军", "师", "旅", "团", "营", "连", "排", "工", "炸", "雷", "旗", "清除"]
+        marks = ["司", "军", "师", "旅", "团", "营", "连", "排", "工", "炸", "雷", "旗", "大", "中", "小", "!", "?", "清除"]
         
         for mark in marks:
             action = menu.addAction(mark)
@@ -862,9 +917,29 @@ class GameWindow(QMainWindow):
     
     def start_game(self):
         """开始游戏"""
+        # 开始前为随机席位分配唯一AI人物，并准备进程层席位-人格映射
+        self.finalize_ai_assignments()
+        assignments = {}
+        try:
+            for seat, persona in self.seat_assignments.items():
+                assignments[int(seat.value)] = str(persona)
+        except Exception:
+            assignments = {}
+        # 顶层配置AI席位队列（固定为三家AI：西、北、东），并通知进程层开始
+        server = getattr(self, "server", None)
+        process = getattr(self, "process", None)
+        if server:
+            try:
+                server.configure_ai_seats([Player.PLAYER2, Player.PLAYER3, Player.PLAYER4])
+            except Exception:
+                pass
+        if process:
+            try:
+                process.start_game(assignments)
+            except Exception:
+                pass
+        # 规则层开始游戏（会触发 on_game_started 信号，驱动进程层调度）
         if self.game_logic.start_game():
-            # 开始前为随机席位分配唯一AI人物
-            self.finalize_ai_assignments()
             # 根据当前开发模式状态同步测试模式与可见性
             self.game_logic.testing_mode = self.dev_mode
             for pos, cell in self.game_logic.board.cells.items():
@@ -877,22 +952,11 @@ class GameWindow(QMainWindow):
             if self.me_name_edit:
                 self.me_name_edit.setReadOnly(True)
             self.update_display()
-            # 启动WebSocket客户端，待连接成功后将发送 start_game
-            if not self.ws_client:
-                self.ws_client = WSClient(
-                    self.WS_URL,
-                    on_connected=lambda: self.ws_connected.emit(),
-                    on_error=lambda msg: self.ws_error.emit(msg),
-                    on_chat_received=lambda d: self.chat_received_ack.emit(d),
-                    on_chat_message=lambda d: self.chat_message_received.emit(d),
-                    on_message=lambda d: None
-                )
-                self.ws_client.start()
-            # 进入对战阶段：允许输入聊天文本，发送按钮在连接建立前保持禁用
+            # 本地模式：不依赖服务器，直接启用聊天输入与发送
             if self.me_chat_input:
                 self.me_chat_input.setEnabled(True)
             if self.me_chat_send_btn:
-                self.me_chat_send_btn.setEnabled(False)
+                self.me_chat_send_btn.setEnabled(True)
             QMessageBox.information(self, "游戏开始", "游戏已开始！")
         else:
             QMessageBox.warning(self, "无法开始", "请先完成棋子布局！")
@@ -985,11 +1049,11 @@ class GameWindow(QMainWindow):
                 self.me_chat_send_btn.setEnabled(False)
         elif self.game_logic.game_state == GameState.PLAYING:
             status = f"游戏进行中 - 当前回合: {self.game_logic.current_player.value}（逆时针）"
-            # 对战阶段：允许输入文本，发送按钮随WS连接状态与锁定标记
+            # 对战阶段：允许输入文本，发送按钮随锁定标记
             if self.me_chat_input:
                 self.me_chat_input.setEnabled(True)
             if self.me_chat_send_btn:
-                self.me_chat_send_btn.setEnabled(self.ws_connected_flag and not self.chat_locked)
+                self.me_chat_send_btn.setEnabled(not self.chat_locked)
         else:
             status = "游戏结束"
             # 结束阶段：禁用聊天输入与发送
@@ -1215,6 +1279,67 @@ class GameWindow(QMainWindow):
         else:
             return (0, 0)
 
+    def _show_player_chat_bubble(self, data: dict):
+        """在玩家头像上方显示一个持续数秒的气泡"""
+        try:
+            text = (data.get("text") or "").strip()
+            seat = data.get("seat")
+            if not text or seat is None:
+                return
+            # 定位头像框
+            frame = self.avatar_frames.get(seat)
+            if not frame:
+                return
+            # 如果已有气泡，先移除
+            prev = self._seat_bubbles.get(seat)
+            if prev:
+                try:
+                    prev["label"].hide()
+                    prev["label"].deleteLater()
+                    if prev.get("timer"):
+                        prev["timer"].stop()
+                except Exception:
+                    pass
+            # 创建气泡标签
+            bubble = QLabel(frame.parent() or self.play_area)
+            bubble.setWordWrap(True)
+            bubble.setText(text)
+            bubble.setStyleSheet("background-color: rgba(255,255,255,220); border: 1px solid #888; border-radius: 10px; padding: 6px; color: #333;")
+            bubble.adjustSize()
+            # 计算位置：在头像框上方居中，稍微偏上
+            fw = frame.width(); fh = frame.height()
+            bx = frame.x() + fw//2 - bubble.width()//2
+            by = frame.y() - bubble.height() - 8
+            # 避免越界到play_area上方
+            if by < 0:
+                by = 0
+            bubble.move(bx, by)
+            bubble.raise_()
+            bubble.show()
+            # 定时隐藏
+            timer = QTimer(bubble)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._clear_bubble_for_seat(seat))
+            timer.start(3000)
+            # 记录
+            self._seat_bubbles[seat] = {"label": bubble, "timer": timer}
+        except Exception:
+            pass
+
+    def _clear_bubble_for_seat(self, seat: Player):
+        prev = self._seat_bubbles.get(seat)
+        if not prev:
+            return
+        try:
+            prev["label"].hide()
+            prev["label"].deleteLater()
+            if prev.get("timer"):
+                prev["timer"].stop()
+        except Exception:
+            pass
+        finally:
+            self._seat_bubbles.pop(seat, None)
+
     def _position_avatar_frames(self):
         """将头像框放置到用户指定的空白区域：
         - 南：南3,5以东
@@ -1249,60 +1374,53 @@ class GameWindow(QMainWindow):
         place(Player.PLAYER2, (6, 3), 'west')  # 西方
 
     def _on_send_chat_clicked(self):
-        """发送聊天：提交后锁定，等待广播解锁"""
-        if not self.ws_connected_flag:
-            QMessageBox.warning(self, "未连接", "尚未连接到服务器，稍后再试。")
-            return
+        """发送聊天：直接写入本地历史并本地广播"""
         if not self.me_chat_input:
             return
         text = (self.me_chat_input.text() or "").strip()
         if not text:
             self.status_bar.showMessage("请输入聊天内容再发送。")
             return
-        # 锁定输入与按钮，待广播后解锁
+        # 锁定输入与按钮
         self.chat_locked = True
         self.me_chat_input.setEnabled(False)
         if self.me_chat_send_btn:
             self.me_chat_send_btn.setEnabled(False)
-        self.status_bar.showMessage("聊天已提交，等待广播...")
-        # 发送到服务器
-        payload = {
-            "type": "submit_chat",
-            "text": text,
-            "utterance_target": "all",
-        }
-        if self.ws_client:
-            self.ws_client.send(payload)
+        # 写入聊天历史
+        try:
+            turn_no = len(self.game_logic.history.records) + 1
+            faction_map = {Player.PLAYER1: "south", Player.PLAYER2: "west", Player.PLAYER3: "north", Player.PLAYER4: "east"}
+            rec = ChatRecord(turn=turn_no, speaker_faction=faction_map[Player.PLAYER1], text=text, target="all")
+            self.game_logic.history.add_chat(rec)
+            # 发射气泡信号（seat固定为南方PLAYER1）
+            try:
+                self.player_chat_bubble.emit({"text": text, "seat": Player.PLAYER1})
+            except Exception:
+                pass
+        except Exception as e:
+            self.chat_locked = False
+            self.me_chat_input.setEnabled(True)
+            if self.me_chat_send_btn:
+                self.me_chat_send_btn.setEnabled(True)
+            self.status_bar.showMessage(f"发送失败：{e}")
+            return
+        # 本地“广播”：状态栏提示并解锁输入
+        self.status_bar.showMessage(f"聊天广播：我方（南）—— {text}")
+        self.chat_locked = False
+        if self.me_chat_input:
+            self.me_chat_input.clear()
+            self.me_chat_input.setEnabled(True)
+        if self.me_chat_send_btn:
+            self.me_chat_send_btn.setEnabled(True)
 
     def _on_ws_connected(self):
-        """WS连接建立后，启用聊天控件，并在需要时同步人物分配与开始游戏"""
+        """本地模式不再使用WS：保留方法以兼容信号，但不做任何网络操作"""
         self.ws_connected_flag = True
         if self.me_chat_input:
             self.me_chat_input.setEnabled(True)
         if self.me_chat_send_btn:
             self.me_chat_send_btn.setEnabled(True)
-        self.status_bar.showMessage("已连接服务器，聊天可用。")
-        # 连接后优先发送人物分配（finalize_ai_assignments 已在 start_game 前完成）
-        try:
-            if self.ws_client:
-                assignments = {}
-                for seat, persona_key in self.seat_assignments.items():
-                    if isinstance(persona_key, str) and persona_key != "random":
-                        assignments[str(seat.value)] = persona_key
-                if assignments:
-                    self.ws_client.send({
-                        "type": "set_persona_assignments",
-                        "assignments": assignments,
-                    })
-        except Exception:
-            pass
-        # 如果当前已经进入对战阶段，通知服务器开始游戏（保证顺序在人物分配之后）
-        try:
-            if self.game_logic.game_state == GameState.PLAYING:
-                if self.ws_client:
-                    self.ws_client.send({"type": "start_game"})
-        except Exception:
-            pass
+        self.status_bar.showMessage("聊天已可用（本地模式）。")
 
     def _on_chat_received_ack(self, data: dict):
         """服务器确认已收到聊天（不解锁，等待广播）"""
@@ -1310,6 +1428,13 @@ class GameWindow(QMainWindow):
 
     def _on_chat_message_broadcast(self, data: dict):
         """服务器广播聊天后，解锁输入并清空"""
+        # 支持 UI 刷新事件：来自进程层的主动刷新请求
+        if isinstance(data, dict) and data.get("event") == "ui_refresh":
+            try:
+                self.update_display()
+            except Exception:
+                pass
+            return
         self.chat_locked = False
         if self.me_chat_input:
             self.me_chat_input.clear()
@@ -1320,6 +1445,33 @@ class GameWindow(QMainWindow):
         t = data.get("text")
         p = data.get("player_id")
         self.status_bar.showMessage(f"聊天广播：玩家{p}：{t}")
+        
+        # 播放TTS音频（如存在）
+        audio_path = data.get("audio_path")
+        if audio_path and os.path.exists(audio_path):
+            try:
+                # 若正在播放，先停止，避免 Windows 下 FFmpeg 插件重置时崩溃
+                if self._audio_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                    self._audio_player.stop()
+                self._audio_player.setSource(QUrl.fromLocalFile(audio_path))
+                self._audio_player.play()
+                # 延时检查，如未进入播放状态则走 Windows WAV 回退播放
+                QTimer.singleShot(600, lambda p=audio_path: self._fallback_play_if_needed(p))
+            except Exception:
+                pass
+
+    def _fallback_play_if_needed(self, audio_path: str):
+        """在 QMediaPlayer 未成功开始播放时，回退为 Windows 异步播放（仅 WAV）。"""
+        try:
+            if (self._audio_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
+                and os.path.exists(audio_path)
+                and audio_path.lower().endswith(".wav")):
+                try:
+                    winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 # === 全局控制模块（开发模式按钮显示/隐藏，统一放置文件末尾）===
 # 将下方变量设为 False 可隐藏主界面上的“开发模式”按钮；设为 True 则显示。

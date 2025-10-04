@@ -47,6 +47,32 @@ class DoubaoClient:
             fh.setLevel(logging.INFO)
             fh.setFormatter(logging.Formatter('%(asctime)s\t%(message)s'))
             self.llm_logger.addHandler(fh)
+        # 控制台输出：截断完整提示词事件，避免污染终端（文件日志保持完整）
+        # 停止向根logger传播，防止重复输出
+        self.llm_logger.propagate = False
+        # 若未配置控制台处理器，则添加一个带截断过滤器的处理器
+        has_stream = any(isinstance(h, logging.StreamHandler) for h in self.llm_logger.handlers)
+        if not has_stream:
+            class _LlmTruncatingFilter(logging.Filter):
+                def __init__(self, max_chars: int = 50) -> None:
+                    super().__init__()
+                    self.max_chars = max_chars
+                def filter(self, record: logging.LogRecord) -> bool:
+                    try:
+                        msg = record.getMessage()
+                        # 仅截断包含完整提示词/完整响应的事件
+                        if '"event": "llm_request_full"' in msg or '"event": "llm_response_full"' in msg:
+                            truncated = msg[:self.max_chars]
+                            record.msg = truncated
+                            record.args = None
+                    except Exception:
+                        pass
+                    return True
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
+            ch.addFilter(_LlmTruncatingFilter(max_chars=50))
+            ch.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
+            self.llm_logger.addHandler(ch)
         self._llm_log_path = log_path
 
     def chat(self, messages: List[Dict[str, str]], thinking_type: str = "disabled", temperature: float = 0.2, top_p: float = 0.9) -> str:
@@ -69,6 +95,15 @@ class DoubaoClient:
                 "message_count": len(messages),
                 "roles": roles,
             }, ensure_ascii=False))
+            # 新增：记录完整提示词（保持log完整，debug仍为折叠）
+            try:
+                self.llm_logger.info(json.dumps({
+                    "event": "llm_request_full",
+                    "model": self.model,
+                    "messages": messages,
+                }, ensure_ascii=False))
+            except Exception:
+                pass
         except Exception:
             logger.warning("[DEBUG] 写入 LLM 请求日志失败（忽略，不影响调用）")
         logger.info(f"[DEBUG] 发起Ark chat，消息数: {len(messages)}，模型: {self.model}")
@@ -121,6 +156,13 @@ class DoubaoClient:
                 raise RuntimeError(f"Unexpected response format (type={resp_type})") from e
         # 记录响应摘要（仅长度）
         try:
+            # 新增：记录完整LLM文本响应
+            self.llm_logger.info(json.dumps({
+                "event": "llm_response_full",
+                "model": self.model,
+                "content": content,
+            }, ensure_ascii=False))
+            # 保留原有摘要日志
             self.llm_logger.info(json.dumps({
                 "event": "llm_response",
                 "model": self.model,

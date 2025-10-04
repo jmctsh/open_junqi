@@ -47,13 +47,7 @@ class WSClient:
         try:
             async with websockets.connect(self.url) as ws:
                 self._ws = ws
-                # 读取欢迎消息（可选）
-                try:
-                    msg = await ws.recv()
-                    _ = json.loads(msg)
-                except Exception:
-                    pass
-                # 回调：连接成功
+                # 回调：连接成功（不再阻塞等待首条服务器消息）
                 if self.on_connected:
                     try:
                         self.on_connected()
