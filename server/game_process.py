@@ -5,7 +5,8 @@ from typing import Any
 # 新增：进程层直接接入规则层与AI层
 from game.game_logic import GameLogic
 from ai.agent import JunqiAgent
-from server.strategies.scoring import score_legal_moves
+from server.strategies.scoring import score_legal_moves, choose_best_move_styled
+from server.perspectives.manager import PerspectiveManager
 # 新增：TTS客户端与临时文件支持
 import os
 import tempfile
@@ -13,6 +14,7 @@ from ai.tts_client import DoubaoTTSClient
 # 新增：后台线程与时间控制
 import threading
 import time
+import random
 import json
 
 
@@ -37,7 +39,10 @@ class GameProcess:
         self._current_turn_faction: Optional[str] = None
         # 新增：规则层与AI层依赖
         self._game_logic: Optional[GameLogic] = None
+        # 默认（全局）代理：当未配置按人格代理时使用
         self._agent: Optional[JunqiAgent] = None
+        # 新增：按人格的代理映射（persona -> agent），例如 player1/player2/player3
+        self._persona_agents: Dict[str, JunqiAgent] = {}
         self._ai_action_consumer: Optional[Callable[[Dict[str, Any]], None]] = None
         # 固定阵营称呼（供 LLM 验证 utterance_target）
         self._faction_names: Dict[str, str] = {"south": "小红", "west": "淡淡色", "north": "小绿", "east": "橙猫猫"}
@@ -52,14 +57,36 @@ class GameProcess:
         # 新增：当后台线程繁忙时，排队一次后续调度，避免错过回合
         self._pending_dispatch: bool = False
         self._pending_prev_player: Optional[Player] = None
+        # 新增：视角管理器（提供位置线索注入）
+        self._perspective_mgr: PerspectiveManager = PerspectiveManager()
 
     def set_game_logic(self, gl: GameLogic) -> None:
         """注册规则层 GameLogic，进程层可据此构建 public_state 与合法走法。"""
         self._game_logic = gl
+        # 附加到视角管理器并立即刷新
+        try:
+            self._perspective_mgr.attach_game_logic(gl)
+        except Exception:
+            pass
 
     def attach_agent(self, agent: JunqiAgent) -> None:
         """注册 AI 代理（JunqiAgent）。"""
         self._agent = agent
+
+    def attach_persona_agents(self, agents: Dict[str, JunqiAgent]) -> None:
+        """注册按人格的 AI 代理映射：键为 "player1"/"player2"/"player3"。
+        若某人格未提供代理，则回退使用全局代理（若存在）。"""
+        if not isinstance(agents, dict):
+            return
+        # 仅保留允许的人格键
+        for k, v in list(agents.items()):
+            if k in self._allowed_personas and isinstance(v, JunqiAgent):
+                self._persona_agents[k] = v
+        try:
+            keys = ",".join(sorted(self._persona_agents.keys())) or "(none)"
+            self._logger.info(f"[DEBUG] 已注册人格代理：{keys}")
+        except Exception:
+            pass
 
     def set_ai_action_consumer(self, consumer: Callable[[Dict[str, Any]], None]) -> None:
         """注册 AI 输出消费回调：用于上层应用执行走子或渲染。"""
@@ -132,104 +159,6 @@ class GameProcess:
         persona = self.get_persona_for_seat(seat)
         return persona in self._allowed_personas
 
-    # 新增：构建供 LLM 使用的 public_state（仅依赖公开信息）
-    def _build_public_state(self) -> Dict[str, Any]:
-        gl = self._game_logic
-        if gl is None:
-            return {}
-        try:
-            board_cells = []
-            piece_id_local_map = []
-            # 统一构建 id_coords：仅为“当前席位”的棋子附加 face（该席位可见自己的棋面）
-            current_seat = self._current_turn_player
-            id_coords_map: Dict[str, Any] = {}
-            for position, cell in gl.board.cells.items():
-                cell_type = getattr(getattr(cell, "cell_type", None), "name", "NORMAL") if cell else "NORMAL"
-                piece_info = None
-                if cell and getattr(cell, "piece", None):
-                    pid = cell.piece.piece_id
-                    piece_info = {
-                        "player_id": cell.piece.player.value,
-                        "piece_id": pid,
-                        "visible": bool(getattr(cell.piece, "visible", False)),
-                        "can_move": bool(cell.piece.can_move()),
-                    }
-                    if pid:
-                        lr, lc = gl._get_local_coords(position, cell.piece.player)
-                        piece_id_local_map.append({
-                            "piece_id": pid,
-                            "player_id": cell.piece.player.value,
-                            "local_row": lr,
-                            "local_col": lc,
-                        })
-                        # 统一公开坐标映射（仅对当前席位的棋子附加 face）
-                        entry: Dict[str, Any] = {"row": lr, "col": lc}
-                        if current_seat is not None and cell.piece.player == current_seat:
-                            try:
-                                entry["face"] = cell.piece.piece_type.value
-                            except Exception:
-                                pass
-                        id_coords_map[str(pid)] = entry
-                board_cells.append({
-                    "row": position.row,
-                    "col": position.col,
-                    "cell_type": cell_type,
-                    "piece": piece_info,
-                })
-        except Exception:
-            board_cells = []
-            piece_id_local_map = []
-            id_coords_map = {}
-        setup_map: Dict[int, bool] = {p.value: bool(gl.setup_complete.get(p, False)) for p in Player}
-        teams = {
-            "south_north": [Player.PLAYER1.value, Player.PLAYER3.value],
-            "east_west": [Player.PLAYER2.value, Player.PLAYER4.value],
-        }
-        # persona_assignments：仅注入已分配的人格席位
-        persona_assignments: Dict[int, str] = {}
-        for s, persona in self._seat_to_persona.items():
-            persona_assignments[int(s)] = str(persona)
-        public_state: Dict[str, Any] = {
-            "state": gl.game_state.value,
-            "current_player": (self._current_turn_player.value if self._current_turn_player else gl.current_player.value),
-            "current_player_faction": self._current_turn_faction,
-            "faction_names": dict(self._faction_names),
-            "teams": teams,
-            "setup_complete": setup_map,
-            "eliminated_players": [p.value for p in gl.eliminated_players],
-            "board": {
-                "rows": gl.board.rows,
-                "cols": gl.board.cols,
-                "cells": board_cells,
-                },
-                # 统一坐标映射入口（仅此一处）
-                "id_coords": id_coords_map,
-                "history": gl.history.to_list(),
-                "persona_assignments": persona_assignments,
-            }
-        return public_state
-
-    # 新增：构建当前席位玩家状态（仅自己的棋面与本地坐标）
-    def _get_player_state(self, player: Player) -> Dict[str, Any]:
-        gl = self._game_logic
-        if gl is None:
-            return {}
-        own_pieces: List[Dict[str, Any]] = []
-        for position, cell in gl.board.cells.items():
-            if cell and getattr(cell, "piece", None) and cell.piece.player == player:
-                pid = cell.piece.piece_id
-                lr, lc = gl._get_local_coords(position, player)
-                own_pieces.append({
-                    "piece_id": pid,
-                    "piece_type": cell.piece.piece_type.value,
-                    "local_row": lr,
-                    "local_col": lc,
-                    "controllable": True,
-                })
-        return {
-            "for_player_id": player.value,
-            "own_pieces": own_pieces,
-        }
 
     # 新增：生成并评分合法走法（供 LLM 选择）
     def _get_legal_moves_scored(self, player: Player) -> List[Dict[str, Any]]:
@@ -242,6 +171,21 @@ class GameProcess:
         except Exception:
             return []
 
+    def _get_best_move(self, player: Player) -> Optional[Dict[str, Any]]:
+        gl = self._game_logic
+        if gl is None:
+            return None
+        raw = gl.board.enumerate_player_legal_moves(player)
+        try:
+            self._logger.debug(f"[DEBUG] 计算最佳走法：seat={player} 合法候选数={len(raw)}")
+        except Exception:
+            pass
+        try:
+            # 优先采用带风格与“反击”判定的选择器；异常时返回 None 交由上层处理
+            return choose_best_move_styled(gl.board, player, raw, gl.history)
+        except Exception:
+            return None
+
     # === 进程信号对接（由规则层触发，上层在初始化时注册AI调度回调） ===
 
     def _schedule_ai_safe(self) -> None:
@@ -253,51 +197,47 @@ class GameProcess:
                 except Exception:
                     pass
                 return
-            # 优先使用内置的 JunqiAgent 调度链路（若已注册依赖）
-            if self._agent and self._game_logic:
+            # 优先使用内置的 JunqiAgent 调度链路（若已注册依赖）；否则走“无模型回退”
+            # 新增：按人格选择具体代理
+            persona = self.get_current_turn_persona()
+            agent = None
+            if persona and persona in self._persona_agents:
+                agent = self._persona_agents.get(persona)
+            else:
+                agent = self._agent
+            if agent and self._game_logic:
                 try:
                     self._logger.debug(
-                        f"[DEBUG] 触发AI调度：seat={self._current_turn_player}, faction={self._current_turn_faction}, persona={self.get_current_turn_persona()}"
+                        f"[DEBUG] 触发AI调度：seat={self._current_turn_player}, faction={self._current_turn_faction}, persona={persona}"
                     )
                 except Exception:
                     pass
-                public_state = self._build_public_state()
-                legal_moves = self._get_legal_moves_scored(self._current_turn_player) if self._current_turn_player else []
-                # 无候选直接跳过
-                if not legal_moves:
+                # 刷新并构建当前席位视角的“位置线索”负载
+                try:
+                    self._perspective_mgr.refresh(self._game_logic)
+                except Exception:
+                    pass
+                location_payload = self._perspective_mgr.build_location_clues_payload(self._current_turn_player)
+                best_move = self._get_best_move(self._current_turn_player) if self._current_turn_player else None
+                # 无候选：深度搜索失败或无合法走法，执行跳过回合
+                if not best_move:
                     try:
-                        self._logger.debug("[DEBUG] 当前无合法走法候选，跳过模型调用。")
+                        self._logger.debug("[DEBUG] 无最佳走法（深度搜索未产出或无合法走法），执行跳过回合。")
+                    except Exception:
+                        pass
+                    try:
+                        if self._game_logic:
+                            self._game_logic.skip_turn()
                     except Exception:
                         pass
                     return
                 player_id = int(self._current_turn_player.value)
-                # 统一数据源：不再注入独立玩家状态块
-                # 不再构造/传递独立的 player_state，统一通过 public_state.id_coords 的 face 提示（仅真人棋子）
-                player_state = self._get_player_state(self._current_turn_player) if self._current_turn_player else None
-                # player_state 已废弃，不再使用
-                # 最低响应时间控制：首次3秒；后续与上次调用不足5秒则补足等待
+                # 统一数据源：仅注入位置线索
                 try:
-                    import time
-                    wait_secs = 0.0
-                    if self._last_llm_call_ts is None:
-                        wait_secs = 3.0
-                    else:
-                        elapsed = time.time() - self._last_llm_call_ts
-                        if elapsed < 5.0:
-                            wait_secs = 5.0 - elapsed
-                    if wait_secs > 0:
-                        try:
-                            self._logger.debug(f"[DEBUG] 最低响应时间控制：等待 {wait_secs:.1f}s 后再调用LLM")
-                        except Exception:
-                            pass
-                        time.sleep(wait_secs)
-                except Exception:
-                    pass
-                try:
-                    action = self._agent.choose_action(
-                        public_state,
-                        legal_moves,
+                    action = agent.choose_action(
+                        location_payload,
                         player_id,
+                        best_move,
                         chat_history=self._game_logic.history if self._game_logic else None,
                         chat_history_recorder=self._game_logic.history if self._game_logic else None,
                     )
@@ -307,50 +247,10 @@ class GameProcess:
                         self._last_llm_call_ts = time.time()
                     except Exception:
                         pass
-                    # 新增：业务日志（完整 action 与关键上下文）
-                    try:
-                        biz_logger = logging.getLogger("junqi_ai.biz")
-                        biz_logger.setLevel(logging.INFO)
-                        biz_logger.propagate = False
-                        # 业务日志文件处理器（避免重复添加）
-                        try:
-                            import os
-                            logs_dir = os.path.join(os.getcwd(), "logs")
-                            os.makedirs(logs_dir, exist_ok=True)
-                            biz_log_path = os.path.join(logs_dir, "biz.log")
-                            need_handler = True
-                            for h in biz_logger.handlers:
-                                if isinstance(h, logging.FileHandler):
-                                    try:
-                                        if getattr(h, "baseFilename", None) == biz_log_path:
-                                            need_handler = False
-                                            break
-                                    except Exception:
-                                        continue
-                            if need_handler:
-                                fh = logging.FileHandler(biz_log_path, encoding="utf-8")
-                                fh.setLevel(logging.INFO)
-                                fh.setFormatter(logging.Formatter('%(asctime)s\t%(message)s'))
-                                biz_logger.addHandler(fh)
-                        except Exception:
-                            pass
-                        # 简要裁剪public_state，避免过大日志：仅输出当前玩家与回合序号
-                        ps_summary = {
-                            "current_player": int(self._current_turn_player.value) if self._current_turn_player else None,
-                            "turn": len(self._game_logic.history.records) + 1 if (self._game_logic and self._game_logic.history) else None,
-                        }
-                        biz_logger.info({
-                            "event": "ai_action",
-                            "player_id": player_id,
-                            "seat_faction": self._seat_to_faction.get(player_id),
-                            "public_state_summary": ps_summary,
-                            "action": action,
-                        })
-                    except Exception:
-                        pass
+                    # 文件业务日志已移除：保留控制台摘要输出，避免生成 d:\junqi_ai\logs 下的文件
                     # 新增：缓存本席位的模型utterance，等待回合结束后再广播与TTS
                     try:
-                        self._cache_utterance(player_id, action, public_state)
+                        self._cache_utterance(player_id, action)
                     except Exception:
                         pass
                     # 输出交给上层消费（执行走子/渲染/记录）
@@ -378,6 +278,82 @@ class GameProcess:
                     except Exception:
                         pass
                     return
+            else:
+                # === 无模型回退：本地算法直接执行最佳走法，并使用兜底发言 ===
+                if not self._game_logic:
+                    return
+                try:
+                    self._perspective_mgr.refresh(self._game_logic)
+                except Exception:
+                    pass
+                planned = self._get_best_move(self._current_turn_player) if self._current_turn_player else None
+                if not planned:
+                    try:
+                        self._logger.debug("[DEBUG] 无模型回退：无最佳走法（深度搜索未产出或无合法走法），执行跳过回合。")
+                    except Exception:
+                        pass
+                    try:
+                        if self._game_logic:
+                            self._game_logic.skip_turn()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    mf = planned.get("from") or {}
+                    mt = planned.get("to") or {}
+                    action = {
+                        "move": {
+                            "from": {"row": int(mf.get("row")), "col": int(mf.get("col"))},
+                            "to": {"row": int(mt.get("row")), "col": int(mt.get("col"))},
+                        },
+                        # 统一字段，与模型输出保持一致
+                        "selected_id": planned.get("id") if isinstance(planned.get("id"), int) else None,
+                        "rationale": "本地算法直接执行最佳走法。",
+                        "confidence": 0.6,
+                        # 复用兜底发言内容（与 agent._clean_utterance 的默认一致）
+                        "utterance": "稳一点先",
+                    }
+                    # 写入聊天历史（保持与模型路径一致的效果）
+                    try:
+                        from game.history import ChatRecord
+                        turn_no = len(getattr(self._game_logic.history, "records", [])) + 1
+                        faction_map = {1: "south", 2: "west", 3: "north", 4: "east"}
+                        player_id = int(self._current_turn_player.value) if self._current_turn_player else 1
+                        speaker_faction = faction_map.get(player_id, "south")
+                        chat_rec = ChatRecord(turn=turn_no, speaker_faction=speaker_faction, text=action["utterance"], target="all")
+                        self._game_logic.history.add_chat(chat_rec)
+                    except Exception:
+                        pass
+                    # 缓存待广播 utterance，并执行走子
+                    try:
+                        pid = int(self._current_turn_player.value) if self._current_turn_player else None
+                        if pid is not None:
+                            self._cache_utterance(pid, action)
+                    except Exception:
+                        pass
+                    if self._ai_action_consumer:
+                        try:
+                            self._ai_action_consumer(action)
+                        except Exception as ce:
+                            try:
+                                self._logger.warning(f"[DEBUG] 无模型回退：AI输出消费失败：{ce}")
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            utter = str(action.get("utterance") or "")
+                            self._logger.info(
+                                f"[DEBUG] 无模型回退：move={action.get('move')} utterance_len={len(utter)}"
+                            )
+                        except Exception:
+                            pass
+                    # 文件业务日志已移除：仅保留控制台输出
+                except Exception as e:
+                    try:
+                        self._logger.warning(f"[DEBUG] 无模型回退失败：{e}")
+                    except Exception:
+                        pass
+                return
             # 删除外部调度器兜底逻辑
             return
         except Exception as e:
@@ -432,7 +408,7 @@ class GameProcess:
         except Exception:
             pass
 
-    def _cache_utterance(self, player_id: int, action: Dict[str, Any], public_state: Dict[str, Any]) -> None:
+    def _cache_utterance(self, player_id: int, action: Dict[str, Any]) -> None:
         """将模型返回的 utterance 暂存，等待该席位回合结束（on_turn_changed）时触发广播与TTS。"""
         if not isinstance(action, dict):
             return
@@ -473,7 +449,12 @@ class GameProcess:
                             self._logger.warning(f"[DEBUG] 后台处理待广播失败：{ex}")
                         except Exception:
                             pass
-                # 再调度AI（含最低响应时间控制与模型调用）
+                # 取消AI间的固定随机等待，直接调度以让深度搜索占用时间预算
+                try:
+                    pass
+                except Exception:
+                    pass
+                # 再调度AI（模型调用）
                 self._schedule_ai_safe()
             finally:
                 self._ai_worker_busy = False
@@ -598,37 +579,5 @@ class GameProcess:
                     pass
         except Exception:
             pass
-        # 新增：历史完整日志（走子与聊天）改为写入 biz.log（junqi_ai.biz）
-        try:
-            # 准备 biz 日志器与文件处理器
-            biz_logger = logging.getLogger("junqi_ai.biz")
-            biz_logger.setLevel(logging.INFO)
-            biz_logger.propagate = False
-            logs_dir = os.path.join(os.getcwd(), "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-            biz_log_path = os.path.join(logs_dir, "biz.log")
-            need_handler = True
-            for h in biz_logger.handlers:
-                if isinstance(h, logging.FileHandler):
-                    try:
-                        if getattr(h, "baseFilename", None) == biz_log_path:
-                            need_handler = False
-                            break
-                    except Exception:
-                        continue
-            if need_handler:
-                fh = logging.FileHandler(biz_log_path, encoding="utf-8")
-                fh.setLevel(logging.INFO)
-                fh.setFormatter(logging.Formatter('%(asctime)s\t%(message)s'))
-                biz_logger.addHandler(fh)
-            # 写入历史快照为JSON字符串
-            history_payload = {
-                "event": "history_snapshot",
-                "turn": len(self._game_logic.history.records) if (self._game_logic and self._game_logic.history) else 0,
-                "records": self._game_logic.history.to_list() if (self._game_logic and self._game_logic.history) else [],
-                "chats": self._game_logic.history.to_chat_list() if (self._game_logic and self._game_logic.history) else [],
-            }
-            biz_logger.info(json.dumps(history_payload, ensure_ascii=False))
-        except Exception:
-            pass
+        # 历史文件日志已移除：不再写入 d:\junqi_ai\logs\biz.log
     # [removed] 误插入的窗口层广播处理函数已移除

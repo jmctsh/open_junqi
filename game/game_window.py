@@ -727,19 +727,27 @@ class GameWindow(QMainWindow):
 
     # 顶层统一实例接线入口
     def set_managers(self, server, process):
-        """由顶层在初始化时注入 GameServer 与 GameProcess，并完成与规则层的接线。"""
-        self.server = server
+        """注入管理对象：本地模式为主（不依赖服务器）。"""
+        # 不再保存 server 引用；仅接入进程层
         self.process = process
-        try:
-            # 先注册进程层，确保信号同步到进程层
-            self.server.set_game_process(self.process)
-        except Exception:
-            pass
-        try:
-            # 再将统一的规则层传入服务器（进程层也已在上一步绑定）
-            self.server.set_game_logic(self.game_logic)
-        except Exception:
-            pass
+        # 本地模式：直接把规则层接到进程层
+        if self.process is not None:
+            try:
+                # 让进程层拥有规则层引用，便于构建 public_state/合法走法
+                self.process.set_game_logic(self.game_logic)
+            except Exception:
+                pass
+            try:
+                # 将规则层信号注册到进程层处理函数
+                self.game_logic.set_signal_handlers(
+                    on_game_started=self.process.on_game_started,
+                    on_turn_changed=self.process.on_turn_changed,
+                    on_player_eliminated=self.process.on_player_eliminated,
+                    on_game_finished=self.process.on_game_finished,
+                )
+            except Exception:
+                pass
+        # 不再接入旧服务器路径：彻底移除对 GameServer 的依赖
         # WebSocket 事件信号
         self.ws_connected.connect(self._on_ws_connected)
         self.ws_error.connect(lambda msg: self.status_bar.showMessage(f"WS错误：{msg}"))
@@ -925,14 +933,8 @@ class GameWindow(QMainWindow):
                 assignments[int(seat.value)] = str(persona)
         except Exception:
             assignments = {}
-        # 顶层配置AI席位队列（固定为三家AI：西、北、东），并通知进程层开始
-        server = getattr(self, "server", None)
+        # 顶层通知进程层开始（本地模式）
         process = getattr(self, "process", None)
-        if server:
-            try:
-                server.configure_ai_seats([Player.PLAYER2, Player.PLAYER3, Player.PLAYER4])
-            except Exception:
-                pass
         if process:
             try:
                 process.start_game(assignments)

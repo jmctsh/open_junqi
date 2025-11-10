@@ -16,11 +16,43 @@
 
 ## AI 代理玩家
 
-接入豆包/ARK API，支持多个 AI 玩家自主决策并轮流发言。
+接入豆包/ARK API，支持多个 AI 玩家轮流发言与分析。走法由本地算法决定（LLM 不再负责选择走法）。
 
-### 环境配置（服务器模式）
+### 环境配置（本地模式）
 
-请参考仓库根目录的 `.env.example`，按注释提示复制为 `.env` 并填写各玩家的 ARK API 与 TTS 凭据即可。
+- 复制根目录 `.env.example` 为 `.env`，按注释填写：
+  - `ARK_API_KEY` 与可选的 `ARK_MODEL`（默认 `doubao-seed-1.6-250615`）。
+  - Doubao TTS 凭据（可选）：`DOUBAO_TTS_APPID`、`DOUBAO_TTS_ACCESS_TOKEN`、`DOUBAO_TTS_SECRET_KEY`、`DOUBAO_TTS_CLUSTER`、`DOUBAO_TTS_VOICE_TYPE`。
+- 提示：若配置 `ARK_API_KEY`，将调用模型生成分析与发言（走法仍由本地算法选出并执行）。未配置时，启用“无模型回退”：AI 玩家仍按本地算法走棋，并广播兜底发言。
+
+## 近期架构调整
+
+- 删除了原本的 WebSocket 接口与服务器：改为单进程本地模式，`main.py` 直接挂接 `GameProcess` 与 `GameWindow`。通过 `set_ai_action_consumer` 执行走子、`set_broadcast_consumer` 广播聊天/TTS。
+- 决策功能分离：LLM 仅负责生成分析（`rationale`）与简短发言（`utterance`），不再选择走法；最佳走法由本地算法提供并作为 `planned_move` 注入提示词。
+- 引入深度搜索遍历决策树：新增模块 `server/strategies/search.py`，实现联盟式 Alpha-Beta 剪枝、Beam 排序以及首层风格过滤；并在 `server/strategies/scoring.py::choose_best_move_styled` 中集成，替代原先的单步打分选择。
+- 反击优先与风格驱动：首层优先考虑“反击位”候选，其次依据玩家风格（防守/进攻/试探）过滤首层候选，再在候选池内进行深度搜索。
+- 广播与日志：模型发言在回合结束后后台合成 TTS 并广播到 UI；完整走子与聊天历史写入 `logs/biz.log`（JSON快照）。
+
+### 深度搜索与原评分机制的区别
+
+- 原评分机制（单步打分）：
+  - 对每个合法走法计算静态评分（吃子收益、旗安全、推进、风险等），只选择当前步的最高分；不模拟后续回合，不考虑队友/对手的响应链。
+  - 优点：极快，稳定可用；缺点：短视，容易被对手“反扑”或陷入交换劣势。
+
+- 深度搜索机制（多步前瞻）：
+  - 联盟式 Alpha-Beta：以“起手方所在阵营”为最大化阵营，同轴队友都走“Max”，另轴对手走“Min”，按实际回合顺序轮替并剪枝。
+  - Beam 排序与限宽：每层对候选走法打分排序，只保留前 `beam_width`（默认 8），提高搜索深度下的效率与稳定性。
+  - 首层风格过滤：首层可按“防守/进攻/试探”类别过滤候选（默认启用），保持不同玩家偏好；与“反击优先”结合先压制敌方入侵。
+  - 叶节点评分：以静态局面评估 `_evaluate_state`（队友最佳即时得分 − 敌方最佳即时得分），并对每层评分应用衰减 `discount`（默认 0.95）。
+- 时间预算：`time_limit_ms`（默认 5000ms）用于控制搜索时长；若在预算内深度搜索无法产生任何走法，则本回合执行“跳过回合”。
+
+- 参数与默认值：
+- `SearchConfig(depth=3, beam_width=8, discount=0.95, time_limit_ms=5000, use_alpha_beta=True, apply_style_filter_first_ply=True)`。
+  - 可在集成点 `choose_best_move_styled` 中调整搜索深度与时间预算；若需要更强对局前瞻，可适度提升 `depth`（如 4），并相应增大 `time_limit_ms`。
+
+- 效果对比：
+  - 深度搜索在“交换与反击链条”“多方协同封线”“旗位安全滚动评估”等场景明显更稳健；但计算成本更高，需用 `beam_width / time_limit_ms` 控制延迟。
+  - 单步评分适合超低延迟与资源受限环境；现仅作为分析与解释的轻量打分，不再充当兜底回退路径。
 
 ## 战绩标记（升星）
 

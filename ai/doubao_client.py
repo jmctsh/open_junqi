@@ -23,57 +23,9 @@ class DoubaoClient:
         self.model = model
         self._client = Ark(api_key=self.api_key, timeout=timeout)
         logger.info(f"[DEBUG] DoubaoClient 初始化完成，模型: {self.model}")
-        # --- LLM 交互日志文件配置 ---
+        # --- LLM 交互日志：仅使用控制台输出，由全局开关统一控制级别 ---
         self.llm_logger = logging.getLogger("junqi_ai.llm")
         self.llm_logger.setLevel(logging.INFO)
-        logs_dir = os.path.join(os.getcwd(), "logs")
-        try:
-            os.makedirs(logs_dir, exist_ok=True)
-        except Exception:
-            pass
-        log_path = os.path.join(logs_dir, "llm_chat.log")
-        # 防止重复添加多个文件处理器
-        need_handler = True
-        for h in self.llm_logger.handlers:
-            if isinstance(h, logging.FileHandler):
-                try:
-                    if getattr(h, "baseFilename", None) == log_path:
-                        need_handler = False
-                        break
-                except Exception:
-                    continue
-        if need_handler:
-            fh = logging.FileHandler(log_path, encoding="utf-8")
-            fh.setLevel(logging.INFO)
-            fh.setFormatter(logging.Formatter('%(asctime)s\t%(message)s'))
-            self.llm_logger.addHandler(fh)
-        # 控制台输出：截断完整提示词事件，避免污染终端（文件日志保持完整）
-        # 停止向根logger传播，防止重复输出
-        self.llm_logger.propagate = False
-        # 若未配置控制台处理器，则添加一个带截断过滤器的处理器
-        has_stream = any(isinstance(h, logging.StreamHandler) for h in self.llm_logger.handlers)
-        if not has_stream:
-            class _LlmTruncatingFilter(logging.Filter):
-                def __init__(self, max_chars: int = 50) -> None:
-                    super().__init__()
-                    self.max_chars = max_chars
-                def filter(self, record: logging.LogRecord) -> bool:
-                    try:
-                        msg = record.getMessage()
-                        # 仅截断包含完整提示词/完整响应的事件
-                        if '"event": "llm_request_full"' in msg or '"event": "llm_response_full"' in msg:
-                            truncated = msg[:self.max_chars]
-                            record.msg = truncated
-                            record.args = None
-                    except Exception:
-                        pass
-                    return True
-            ch = logging.StreamHandler()
-            ch.setLevel(logging.INFO)
-            ch.addFilter(_LlmTruncatingFilter(max_chars=50))
-            ch.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
-            self.llm_logger.addHandler(ch)
-        self._llm_log_path = log_path
 
     def chat(self, messages: List[Dict[str, str]], thinking_type: str = "disabled", temperature: float = 0.2, top_p: float = 0.9) -> str:
         """

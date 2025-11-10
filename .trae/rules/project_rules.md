@@ -1,5 +1,0 @@
-- 本项目是单机架构：1名真人玩家对战3个AI，服务器仅用于规则校验、状态查询与为AI提供操作API，不用于多人对战或实时广播。AI接收信息的唯一途径是“本地历史记录器（moves/chat）→在下一次模型调用时注入到统一的 public_state 语料”，LLM为单向拉取模型，不接收服务器的实时反馈。玩家可见信息通过在 public_state.id_coords 为自己的棋子附加 face 字段体现，禁止另起独立的玩家状态提示块。任何试图以服务器推送/广播来驱动 LLM 的实现均为错误，应以本地 history 注入为准。
-- 架构分层：顶层（game_logic.py、game_window.py）负责规则/棋盘/UI，不与LLM直接交互；AI进程管理层（game_process.py、agent.py）负责调度、提示词、模型调用与动作解析，且 agent.py 是提示词的唯一入口与出口；history.py、scoring.py 等仅为 agent.py 提供数据源。
-- 顶层信号函数（由规则层触发，供管理层消费）：on_game_started、on_turn_changed、on_player_eliminated、on_game_finished。
-- 信号与调度约定：这四个信号是AI管理层的唯一驱动入口；game_process.py 监听并调度。收到 on_game_started 或 on_turn_changed 时调度当前为AI的席位一次；on_player_eliminated 与 on_game_finished 仅做记录与收尾，避免额外调度。
-- 概念层：玩家编号（player1、player2、player3）仅绑定三种人格提示词档案，区别在行为权重、策略倾向与语气风格，属于纯“人格配置”，不参与座位或状态判定；流程层：方位/席位（orientation/seat）在 on_game_started 触发时由 UI 一次性固定并记录为本局座次，贯穿整局，用于确定视角与状态注入、回合调度与规则判定的依据；规则层：在 on_game_started 时必须建立并冻结 player ↔ 方位 的一对一映射，明确 player1-3 仅表示人格提示词而非方位；约束层：后续所有 AI 调度与提示词注入一律以“方位”作为唯一依据（仅对真人所在方位的棋子在 public_state.id_coords 附加 face），避免以玩家编号替代方位进行任何规则或状态判断。

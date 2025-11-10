@@ -43,7 +43,7 @@ def normalize_row(row: str) -> str:
 FORMATIONS: Dict[str, List[str]] = {
     # 十大名阵（南方本地坐标 6×5）
     '河东狮吼': [
-        '司兵连排师',
+        '师兵连排师',
         '旅…连…炸',
         '炸营…团旅',
         '军…兵…连',
